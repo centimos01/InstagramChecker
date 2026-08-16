@@ -1,0 +1,49 @@
+# ============================================================================
+#  InstagramChecker - docker-compose
+#  `docker compose up -d --build`
+# ============================================================================
+
+services:
+  instagram-checker:
+    build: .
+    container_name: instagram-checker
+    restart: unless-stopped
+
+    # Variables sensibles desde .env (no se copian a la imagen).
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+
+    # init: true inyecta tini -> reap de zombies + reenvío de SIGTERM.
+    init: true
+
+    # Hardening para un contenedor mínimo.
+    read_only: true                      # el FS raíz es de solo lectura
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid      # ruta temporal para urllib/python
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Límites de recursos (home server modesto).
+    cpus: 0.5
+    mem_limit: 512m
+    mem_reservation: 128m
+
+    # Volumen persistente: sesión de Instagram (session.json) + SQLite.
+    # Como volumen NOMBRADO, Docker copia automáticamente el propietario
+    # (usuario 'app') al crearlo, evitando problemas de permisos.
+    volumes:
+      - checker-data:/data
+
+    # Evita que el log del contenedor crezca sin límite en el disco del host.
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  checker-data:

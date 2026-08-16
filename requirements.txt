@@ -1,0 +1,6 @@
+# Cliente ligero de Instagram (sin extras "video"/"full": no arrastra
+# moviepy ni numpy). Gestiona sesión/cookies y paginación de seguidores.
+instagrapi==2.18.16
+
+# Solo se usa para la API REST de Discord (envío de alertas).
+requests>=2.34.2,<3
