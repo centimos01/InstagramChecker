@@ -7,6 +7,12 @@ siguen de vuelta) y envía una alerta a un canal de Discord mediante un Bot.
 Stack: **Python 3.13 (Debian Trixie) + instagrapi + SQLite (WAL)**. Sin frameworks
 web, un único proceso con bucle de temporización + jitter aleatorio.
 
+Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimos01/InstagramChecker)
+
+```bash
+git clone https://github.com/centimos01/InstagramChecker.git
+```
+
 ## Contenido
 
 | Fichero            | Descripción |
@@ -34,15 +40,22 @@ web, un único proceso con bucle de temporización + jitter aleatorio.
 
 ## Desplegar en otra máquina
 
-Esta carpeta es el proyecto fuente; se construye y ejecuta **en la máquina
-destino** (p. ej. tu Debian 13 del servidor), no donde la hayas editado.
+El código está en GitHub, así que en la máquina destino (tu Debian 13) puedes
+clonarlo directamente:
 
 ```bash
-# Desde la máquina actual, copia el proyecto al servidor Debian
-scp -r InstagramChecker usuario@IP_DEL_SERVIDOR:~/InstagramChecker
-
-# En el servidor, continúa con los pasos 1-4 (todo se hace ahí)
+ssh usuario@IP_DEL_SERVIDOR
+git clone https://github.com/centimos01/InstagramChecker.git
+cd InstagramChecker
 ```
+
+Si la máquina destino no tiene git, también puedes copiar la carpeta con `scp`:
+
+```bash
+scp -r InstagramChecker usuario@IP_DEL_SERVIDOR:~/InstagramChecker
+```
+
+En ambos casos, continúa con los pasos 1–4 (todo se ejecuta en el servidor).
 
 Importante:
 
