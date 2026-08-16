@@ -26,7 +26,11 @@ web, un único proceso con bucle de temporización + jitter aleatorio.
 3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
 4. Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord.
 5. Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
-6. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
+6. Si un ciclo falla (problema de red, login o API de Instagram), envía un
+   aviso de **error** al canal de Discord y reintenta en el siguiente ciclo.
+   Para no saturar el canal solo alerta la primera caída seguida; cuando el
+   servicio se recupera vuelve a avisar si algo vuelve a fallar.
+7. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
 
 ## Desplegar en otra máquina
 

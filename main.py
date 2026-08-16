@@ -22,6 +22,9 @@ Arquitectura
   "volvieron a seguirte" para avisar de nuevo si te vuelven a dejar).
 * Bucle en segundo plano con intervalo configurable + jitter aleatorio para
   comportarse de forma orgánica.
+* Si un ciclo falla (red, login o API de Instagram) se envía un aviso de error
+  a Discord y se reintenta en el siguiente ciclo; solo se alerta la primera
+  caída seguida para no saturar el canal.
 
 Variables de entorno: ver .env.example.
 """
@@ -374,6 +377,64 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Avisos de fallo por Discord
+# ---------------------------------------------------------------------------
+
+
+def describe_failure(exc: BaseException) -> str:
+    """Convierte una excepción en un texto claro para el log y la alerta."""
+    if isinstance(exc, LoginRequired):
+        return (
+            f"Sesión de Instagram inválida o caducada ({exc}). "
+            "Rellena INSTAGRAM_PASSWORD (+2FA si lo pide) en .env y reinicia."
+        )
+    if isinstance(exc, RuntimeError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def notify_failure(conn: sqlite3.Connection, cfg: dict, exc: BaseException, started: str) -> None:
+    """
+    Registra un ciclo fallido en SQLite y, si es el primer fallo tras un ciclo
+    correcto, envía un aviso de error a Discord (evita repetir la alerta cada
+    ciclo mientras el problema persista).
+    """
+    try:
+        finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        description = describe_failure(exc)
+
+        # ¿Es la primera vez que falla tras un ciclo con éxito?
+        prev = conn.execute("SELECT ok FROM checks ORDER BY id DESC LIMIT 1").fetchone()
+        first_failure = prev is None or prev["ok"] == 1
+
+        conn.execute(
+            """INSERT INTO checks (started_at, finished_at, ok, following, followers, unfollows)
+               VALUES (?, ?, 0, 0, 0, 0)""",
+            (started, finished),
+        )
+        conn.commit()
+
+        log.error("Fallo en la comprobación: %s", description)
+        if not first_failure:
+            log.info("El problema persiste desde el ciclo anterior; no se reenvía alerta.")
+            return
+
+        footer = f"Chequeo fallido #{conn.lastrowid} · se reintentará en el siguiente ciclo"
+        discord_embed(
+            cfg["discord_token"],
+            cfg["discord_channel"],
+            "Error en la comprobación de Instagram",
+            f"```\n{description}\n```",
+            0xFAA61A,  # ámbar Discord (errores del sistema)
+            footer=footer,
+            timestamp=finished,
+        )
+    except Exception:
+        # Nunca dejes que un fallo al notificar el error mate el bucle principal.
+        log.exception("No se pudo registrar/notificar el fallo del ciclo.")
+
+
+# ---------------------------------------------------------------------------
 # Punto de entrada
 # ---------------------------------------------------------------------------
 
@@ -429,15 +490,13 @@ def main() -> None:
     )
 
     while True:
+        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
             run_once(conn, cfg)
-        except LoginRequired as exc:
-            log.error("Sesión inválida (LoginRequired): %s. Revisa session.json o "
-                      "fija INSTAGRAM_PASSWORD y reinicia.", exc)
-        except RuntimeError as exc:
-            log.error("%s", exc)
-        except Exception:
-            log.exception("Fallo en la comprobación; se reintentará en el siguiente ciclo.")
+        except Exception as exc:
+            # Problemas de conexión, login o API: avisa por Discord y reintenta
+            # en el siguiente ciclo (sin spam: solo la primera caída seguida).
+            notify_failure(conn, cfg, exc, started)
 
         # Espera = intervalo configurado + jitter aleatorio (comportamiento orgánico).
         total = cfg["interval_hours"] * 3600 + random.uniform(0, cfg["jitter_minutes"] * 60)
