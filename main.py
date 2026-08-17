@@ -25,6 +25,8 @@ Arquitectura
 * Si un ciclo falla (red, login o API de Instagram) se envía un aviso de error
   a Discord y se reintenta en el siguiente ciclo; solo se alerta la primera
   caída seguida para no saturar el canal.
+* Rich Presence en tiempo real: el bot muestra en Discord los conteos actualizados
+  de seguidos/seguidores y el último chequeo, actualizado en cada ciclo.
 
 Variables de entorno: ver .env.example.
 """
@@ -32,17 +34,26 @@ Variables de entorno: ver .env.example.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import logging
 import os
 import random
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
 import requests
 from instagrapi import Client
 from instagrapi.exceptions import ChallengeRequired, LoginRequired, TwoFactorRequired
+
+try:
+    import websockets  # noqa: F401 — opcional; si falta, el Gateway no arranca.
+    _HAS_WS = True
+except ImportError:
+    _HAS_WS = False
 
 log = logging.getLogger("ig-check")
 
@@ -356,6 +367,8 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
 
     # ---- Notificar por Discord solo las bajas nuevas. ----
     if new_unfollows:
+        # Mostrar brevemente el unfollow más reciente en la presencia del bot.
+        update_bot_presence(len(following), len(followers), unfollow=new_unfollows[0])
         check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         footer = (
             f"Chequeo #{check_id} · seguidos: {len(following)} "
@@ -373,6 +386,9 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
         log.info("Enviadas alertas para %d unfollow(s) nuevos.", len(new_unfollows))
     else:
         log.info("Sin nuevos unfollows en este ciclo.")
+
+    # Actualizar presencia del bot con los conteos finales.
+    update_bot_presence(len(following), len(followers))
 
     return new_unfollows
 
@@ -437,6 +453,178 @@ def notify_failure(conn: sqlite3.Connection, cfg: dict, exc: BaseException, star
 
 
 # ---------------------------------------------------------------------------
+# Discord Gateway — Rich Presence en tiempo real
+# ---------------------------------------------------------------------------
+
+_gateway: DiscordGateway | None = None  # instancia global (ver más abajo)
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Devuelve 'HH:MM:SS' transcurridos."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+class DiscordGateway:
+    """Mantiene una conexión WebSocket al Gateway de Discord en un hilo
+    dedicado, para enviar actualizaciones de presencia en tiempo real."""
+
+    GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
+    RECONNECT_DELAY = 5  # segundos antes de reconectar
+
+    def __init__(self, token: str):
+        if not _HAS_WS:
+            raise RuntimeError("El paquete 'websockets' no está instalado.")
+        self.token = token
+        self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self.ws = None
+        self.heartbeat_interval: float = 41250  # se sobreescribe con Hello
+        self.sequence: int | None = None
+        self._presence_state = "Esperando primera comprobación…"
+        self._presence_details = ""
+        self._presence_ts: float | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="gateway")
+
+    # -- Lifecycle ----------------------------------------------------------
+
+    def start(self) -> None:
+        if not _HAS_WS:
+            log.warning("websockets no instalado; Rich Presence deshabilitado.")
+            return
+        self._thread.start()
+        log.info("Discord Gateway iniciado en segundo plano.")
+
+    def stop(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+    # -- Hilos / async ------------------------------------------------------
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._connect_loop())
+
+    async def _connect_loop(self) -> None:
+        """Bucle de reconexión: si la conexión cae, reintenta."""
+        while self.loop.is_running():
+            try:
+                async with websockets.connect(
+                    self.GATEWAY,
+                    additional_headers={"Authorization": f"Bot {self.token}"},
+                    close_timeout=5,
+                ) as ws:
+                    self.ws = ws
+                    log.info("Gateway conectado.")
+                    await self._handle_session()
+            except websockets.ConnectionClosed as exc:
+                log.warning("Gateway desconectado (%s). Reconectando en %ds…",
+                            exc, self.RECONNECT_DELAY)
+            except Exception as exc:
+                log.warning("Gateway error (%s). Reconectando en %ds…",
+                            exc, self.RECONNECT_DELAY)
+            await asyncio.sleep(self.RECONNECT_DELAY)
+
+    async def _handle_session(self) -> None:
+        # 1) Hello — obtener heartbeat_interval
+        raw = await self.ws.recv()
+        hello = json.loads(raw)
+        if hello.get("op") != 10:
+            return
+        self.heartbeat_interval = hello["d"]["heartbeat_interval"] / 1000
+
+        # 2) Identify
+        await self.ws.send(json.dumps({
+            "op": 2,
+            "d": {
+                "token": self.token,
+                "properties": {"os": "linux", "browser": "python", "device": ""},
+                "intents": 0,
+            },
+        }))
+
+        # 3) Enviar presencia inicial
+        await self._send_presence()
+
+        # 4) Heartbeat + escuchar en paralelo
+        await asyncio.gather(self._heartbeat(), self._listen())
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            try:
+                await self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
+            except websockets.ConnectionClosed:
+                return
+
+    async def _listen(self) -> None:
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                op = msg.get("op")
+                if op == 1:  # Heartbeat request
+                    await self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
+                elif op == 11:  # Heartbeat ACK
+                    pass
+                if msg.get("s") is not None:
+                    self.sequence = msg["s"]
+        except websockets.ConnectionClosed:
+            return
+
+    # -- Presencia ----------------------------------------------------------
+
+    def update_presence(self, state: str, details: str,
+                        timestamp: float | None = None) -> None:
+        """Programa una actualización de presencia en el hilo del Gateway."""
+        self._presence_state = state
+        self._presence_details = details
+        self._presence_ts = timestamp
+        if self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._send_presence(), self.loop)
+
+    async def _send_presence(self) -> None:
+        if not self.ws:
+            return
+        activity: dict = {
+            "name": "Instagram",
+            "type": 3,  # Watching
+            "state": self._presence_state,
+        }
+        if self._presence_details:
+            activity["details"] = self._presence_details
+        if self._presence_ts:
+            activity["timestamps"] = {"start": int(self._presence_ts)}
+        payload = {
+            "op": 3,
+            "d": {
+                "since": None,
+                "activities": [activity],
+                "status": "online",
+                "afk": False,
+            },
+        }
+        try:
+            await self.ws.send(json.dumps(payload))
+        except websockets.ConnectionClosed:
+            pass
+
+
+def update_bot_presence(following: int = 0, followers: int = 0,
+                        unfollow: str | None = None) -> None:
+    """Actualiza la presencia del bot en Discord con los datos actuales."""
+    if _gateway is None:
+        return
+    if unfollow:
+        state = f"Nuevo unfollow: @{unfollow}"
+    else:
+        state = f"{following} seguidos · {followers} seguidores"
+    _gateway.update_presence(
+        state,
+        "Último chequeo",
+        timestamp=time.time(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Punto de entrada
 # ---------------------------------------------------------------------------
 
@@ -476,6 +664,15 @@ def main() -> None:
         sys.exit(2)
 
     conn = db_connect(cfg["db_file"])
+
+    # Iniciar el Gateway de Discord para Rich Presence (en segundo plano).
+    global _gateway
+    try:
+        _gateway = DiscordGateway(cfg["discord_token"])
+        _gateway.start()
+    except Exception as exc:
+        log.warning("No se pudo iniciar el Gateway de Discord (%s). "
+                    "Rich Presence deshabilitado.", exc)
 
     # Modo manual: una sola pasada (genera session.json la primera vez).
     if args.once:

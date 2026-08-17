@@ -4,3 +4,6 @@ instagrapi==2.18.16
 
 # Solo se usa para la API REST de Discord (envío de alertas).
 requests>=2.34.2,<3
+
+# Gateway de Discord para Rich Presence en tiempo real.
+websockets>=13.0,<14
