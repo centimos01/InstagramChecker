@@ -13,6 +13,10 @@ Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimo
 git clone https://github.com/centimos01/InstagramChecker.git
 ```
 
+**Instalador rápido:** ejecuta `bash install.sh` en el servidor y sigue las
+preguntas — instala Docker, configura `.env`, construye la imagen y genera
+la sesión automáticamente.
+
 ## Contenido
 
 | Fichero            | Descripción |
@@ -21,6 +25,7 @@ git clone https://github.com/centimos01/InstagramChecker.git
 | `docker-compose.yml` | Límites de CPU/RAM, volumen persistente `checker-data:/data`, hardening |
 | `requirements.txt` | Solo `instagrapi` (sin extras pesados) y `requests` |
 | `main.py`          | Script autónomo comentado: login por sesión, snapshots SQLite, comparación, alerta Discord |
+| `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
 ## Qué hace `main.py` en cada ciclo
@@ -40,18 +45,12 @@ git clone https://github.com/centimos01/InstagramChecker.git
 
 ## Desplegar en otra máquina
 
-El código está en GitHub, así que en la máquina destino (tu Debian 13) puedes
-clonarlo directamente:
+**Opción recomendada** (todo automático con `install.sh`, ver más arriba).
+
+Si prefieres hacerlo paso a paso o la máquina destino no tiene git:
 
 ```bash
-ssh usuario@IP_DEL_SERVIDOR
-git clone https://github.com/centimos01/InstagramChecker.git
-cd InstagramChecker
-```
-
-Si la máquina destino no tiene git, también puedes copiar la carpeta con `scp`:
-
-```bash
+# Copiar la carpeta al servidor
 scp -r InstagramChecker usuario@IP_DEL_SERVIDOR:~/InstagramChecker
 ```
 

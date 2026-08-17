@@ -8,3 +8,4 @@ __pycache__
 .dockerignore
 Dockerfile
 docker-compose.yml
+install.sh
