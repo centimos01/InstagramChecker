@@ -5,7 +5,9 @@ detecta quién te ha dejado de seguir (usuarios a los que sigues pero que ya no 
 siguen de vuelta) y envía una alerta a un canal de Discord mediante un Bot.
 
 Stack: **Python 3.13 (Debian Trixie) + instagrapi + SQLite (WAL)**. Sin frameworks
-web, un único proceso con bucle de temporización + jitter aleatorio.
+web, un único proceso con bucle de temporización + jitter aleatorio. Incluye
+**Rich Presence en tiempo real** en Discord (contadores actualizados de seguidos
+y seguidores).
 
 Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimos01/InstagramChecker)
 
@@ -23,8 +25,8 @@ la sesión automáticamente.
 |--------------------|-------------|
 | `Dockerfile`       | Imagen `python:3.13-slim` (basada en Debian 13/Trixie), usuario sin privilegios, FS raíz de solo lectura |
 | `docker-compose.yml` | Límites de CPU/RAM, volumen persistente `checker-data:/data`, hardening |
-| `requirements.txt` | Solo `instagrapi` (sin extras pesados) y `requests` |
-| `main.py`          | Script autónomo comentado: login por sesión, snapshots SQLite, comparación, alerta Discord |
+| `requirements.txt` | `instagrapi` (sin extras pesados), `requests` y `websockets` (Gateway de Discord) |
+| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence en tiempo real |
 | `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
@@ -35,13 +37,19 @@ la sesión automáticamente.
 2. Descarga la lista de **seguidos** y de **seguidores** (todas las páginas),
    con una pausa aleatoria de 30–90 s entre ambas llamadas.
 3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
-4. Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord.
+4. Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord
+   con **todos** los usernames (sin truncar). Si la lista es muy larga se
+   divide automáticamente en varios embeds en el mismo mensaje.
 5. Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
 6. Si un ciclo falla (problema de red, login o API de Instagram), envía un
    aviso de **error** al canal de Discord y reintenta en el siguiente ciclo.
    Para no saturar el canal solo alerta la primera caída seguida; cuando el
    servicio se recupera vuelve a avisar si algo vuelve a fallar.
-7. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
+7. Actualiza la **Rich Presence** del bot en Discord con los conteos actualizados
+   (seguidos/seguidores) y un cronómetro en tiempo real desde el último chequeo.
+   Al detectar un unfollow se muestra brevemente el username antes de volver
+   a los conteos.
+8. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
 
 ## Desplegar en otra máquina
 
@@ -72,6 +80,9 @@ Importante:
    → abre la URL generada e invita al bot a tu servidor/canal.
 4. Obtén el ID del canal: *Configuración del usuario → Avanzado → Modo desarrollador*,
    clic derecho sobre el canal → *Copiar ID del canal* → `DISCORD_CHANNEL_ID`.
+
+> **Nota:** el bot muestra Rich Presence en tiempo real automáticamente (no
+> necesita permisos extra ni configuración en el Developer Portal).
 
 ## 2. Instalar Docker en Debian 13 (Trixie)
 
@@ -156,6 +167,9 @@ docker run --rm \
 - **Instagram pide verificación manual (`ChallengeRequired`)** → entra en la app
   o web de Instagram **desde la IP del servidor**, confirma la sesión, y deja de
   ejecutar unas horas. Respeta un intervalo mínimo de **4 h** (default: 6 h).
+- **`websockets` no instalado / Gateway no arranca** → la presencia del bot no
+  se actualiza pero el servicio funciona normal. Reinstala dependencias:
+  `docker compose up -d --build`.
 
 ## Notas de uso responsable
 

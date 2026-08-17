@@ -197,34 +197,66 @@ def compute_new_unfollows(conn: sqlite3.Connection, following: dict, followers: 
 # ---------------------------------------------------------------------------
 
 DISCORD_API = "https://discord.com/api/v10"
+EMBED_DESC_LIMIT = 4096
+MAX_EMBEDS_PER_MSG = 10
 
 
 def discord_embed(token: str, channel_id: str, title: str, description: str,
                   color: int, footer: str | None = None, timestamp: str | None = None) -> bool:
-    """Publica un embed en el canal indicado. Devuelve True si fue aceptado."""
-    embed = {"title": title, "description": description, "color": color}
-    if footer:
-        embed["footer"] = {"text": footer}
-    if timestamp:
-        embed["timestamp"] = timestamp
-    resp = requests.post(
-        f"{DISCORD_API}/channels/{channel_id}/messages",
-        json={"embeds": [embed]},
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        log.error("Discord devolvió %s: %s", resp.status_code, resp.text[:300])
-        return False
-    return True
+    """Publica uno o más embeds en el canal indicado.
+    Si la descripción supera el límite de Discord (4096 chars), la divide en
+    varios embeds enviados en un solo mensaje (máx. 10 embeds/mensaje)."""
+    # Dividir la descripción por líneas si es demasiado larga.
+    chunks: list[str] = []
+    if len(description) <= EMBED_DESC_LIMIT:
+        chunks = [description]
+    else:
+        lines = description.split("\n")
+        current = ""
+        for line in lines:
+            # +1 por el \n que se añade al unir
+            if current and len(current) + 1 + len(line) > EMBED_DESC_LIMIT:
+                chunks.append(current)
+                current = line
+            else:
+                current = f"{current}\n{line}" if current else line
+        if current:
+            chunks.append(current)
+
+    # Discord permite máximo 10 embeds por mensaje.
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        embed: dict = {
+            "title": title if i == 0 else f"{title} (parte {i + 1})",
+            "description": chunk,
+            "color": color,
+        }
+        if footer and i == len(chunks) - 1:
+            embed["footer"] = {"text": footer}
+        if timestamp and i == 0:
+            embed["timestamp"] = timestamp
+        embeds.append(embed)
+
+    ok = True
+    for batch_start in range(0, len(embeds), MAX_EMBEDS_PER_MSG):
+        batch = embeds[batch_start:batch_start + MAX_EMBEDS_PER_MSG]
+        resp = requests.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            json={"embeds": batch},
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            log.error("Discord devolvió %s: %s", resp.status_code, resp.text[:300])
+            ok = False
+    return ok
 
 
-def format_list(names: list[str], limit: int = 25) -> str:
-    """Formatea los usernames como lista de Markdown, truncando a 'limit'."""
-    lines = [f"• [{n}](https://instagram.com/{n})" for n in names[:limit]]
-    extra = len(names) - len(lines)
-    if extra > 0:
-        lines.append(f"…y {extra} más")
+def format_list(names: list[str], limit: int = 0) -> str:
+    """Formatea los usernames como lista de Markdown."""
+    if limit:
+        names = names[:limit]
+    lines = [f"• [{n}](https://instagram.com/{n})" for n in names]
     return "\n".join(lines) or "*(lista vacía)*"
 
 
