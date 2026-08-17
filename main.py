@@ -356,8 +356,9 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
 
     # ---- Notificar por Discord solo las bajas nuevas. ----
     if new_unfollows:
+        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         footer = (
-            f"Chequeo #{conn.lastrowid} · seguidos: {len(following)} "
+            f"Chequeo #{check_id} · seguidos: {len(following)} "
             f"· seguidores: {len(followers)}"
         )
         discord_embed(
@@ -419,7 +420,8 @@ def notify_failure(conn: sqlite3.Connection, cfg: dict, exc: BaseException, star
             log.info("El problema persiste desde el ciclo anterior; no se reenvía alerta.")
             return
 
-        footer = f"Chequeo fallido #{conn.lastrowid} · se reintentará en el siguiente ciclo"
+        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        footer = f"Chequeo fallido #{check_id} · se reintentará en el siguiente ciclo"
         discord_embed(
             cfg["discord_token"],
             cfg["discord_channel"],
