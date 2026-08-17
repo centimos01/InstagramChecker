@@ -510,7 +510,6 @@ class DiscordGateway:
             try:
                 async with websockets.connect(
                     self.GATEWAY,
-                    additional_headers={"Authorization": f"Bot {self.token}"},
                     close_timeout=5,
                 ) as ws:
                     self.ws = ws
