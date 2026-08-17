@@ -51,6 +51,18 @@ la sesión automáticamente.
    a los conteos.
 8. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
 
+## Comandos slash de Discord
+
+El bot registra automáticamente estos comandos al iniciar:
+
+| Comando | Descripción |
+|---------|-------------|
+| `/status` | Muestra seguidos, seguidores, unfollows del último chequeo, próximo chequeo y total de comprobaciones |
+| `/check` | Fuerza una comprobación manual (misma lógica que `--once` pero sin reiniciar el contenedor) |
+
+Los comandos se registran globalmente al conectar al Gateway y están disponibles
+en todos los servidores donde esté el bot.
+
 ## Desplegar en otra máquina
 
 **Opción recomendada** (todo automático con `install.sh`, ver más arriba).
@@ -76,8 +88,9 @@ Importante:
 
 1. Entra en https://discord.com/developers/applications → *New Application*.
 2. Pestaña **Bot** → *Reset Token* → copia el token (va a `DISCORD_BOT_TOKEN`).
-3. En **OAuth2 → URL Generator**, marca scope `bot` y permiso *Send Messages*
-   → abre la URL generada e invita al bot a tu servidor/canal.
+3. En **OAuth2 → URL Generator**, marca scope `bot` y `applications.commands`,
+   y permiso *Send Messages* → abre la URL generada e invita al bot a tu
+   servidor/canal.
 4. Obtén el ID del canal: *Configuración del usuario → Avanzado → Modo desarrollador*,
    clic derecho sobre el canal → *Copiar ID del canal* → `DISCORD_CHANNEL_ID`.
 

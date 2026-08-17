@@ -80,10 +80,10 @@ def env_float(name: str, default: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def db_connect(path: str) -> sqlite3.Connection:
+def db_connect(path: str, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Abre (y crea si hace falta) la base de datos y aplica el esquema."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     # WAL: mejor concurrencia y durabilidad para escrituras periódicas.
     conn.execute("PRAGMA journal_mode=WAL")
@@ -489,6 +489,7 @@ def notify_failure(conn: sqlite3.Connection, cfg: dict, exc: BaseException, star
 # ---------------------------------------------------------------------------
 
 _gateway: DiscordGateway | None = None  # instancia global (ver más abajo)
+_check_lock = threading.Lock()  # evita que run_once se ejecute en paralelo
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -505,14 +506,17 @@ class DiscordGateway:
     GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
     RECONNECT_DELAY = 5  # segundos antes de reconectar
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, conn: sqlite3.Connection, cfg: dict):
         if not _HAS_WS:
             raise RuntimeError("El paquete 'websockets' no está instalado.")
         self.token = token
+        self.conn = conn
+        self.cfg = cfg
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self.ws = None
         self.heartbeat_interval: float = 41250  # se sobreescribe con Hello
         self.sequence: int | None = None
+        self.app_id: str | None = None
         self._presence_state = "Esperando primera comprobación…"
         self._presence_details = ""
         self._presence_ts: float | None = None
@@ -573,7 +577,13 @@ class DiscordGateway:
             },
         }))
 
-        # 3) Enviar presencia inicial
+        # 3) Obtener application_id y registrar slash commands
+        me = await self._rest("GET", "/users/@me")
+        if me:
+            self.app_id = me["id"]
+            await self._register_commands()
+
+        # 4) Enviar presencia inicial
         await self._send_presence()
 
         # 4) Heartbeat + escuchar en paralelo
@@ -598,6 +608,9 @@ class DiscordGateway:
                     pass
                 if msg.get("s") is not None:
                     self.sequence = msg["s"]
+                # Slash commands
+                if op == 0 and msg.get("t") == "INTERACTION_CREATE":
+                    asyncio.create_task(self._handle_interaction(msg["d"]))
         except websockets.ConnectionClosed:
             return
 
@@ -637,6 +650,176 @@ class DiscordGateway:
             await self.ws.send(json.dumps(payload))
         except websockets.ConnectionClosed:
             pass
+
+    # -- REST helper --------------------------------------------------------
+
+    async def _rest(self, method: str, path: str, **kw):
+        """Llamada REST a la API de Discord (en un hilo para no bloquear)."""
+        url = f"https://discord.com/api/v10{path}"
+        headers = {"Authorization": f"Bot {self.token}"}
+
+        def _do():
+            resp = requests.request(method, url, headers=headers, timeout=10, **kw)
+            if resp.status_code < 300:
+                try:
+                    return resp.json()
+                except ValueError:
+                    return {}
+            log.debug("Discord REST %s %s → %s", method, path, resp.status_code)
+            return None
+
+        return await asyncio.to_thread(_do)
+
+    # -- Slash commands -----------------------------------------------------
+
+    SLASH_COMMANDS = [
+        {
+            "name": "status",
+            "description": "Muestra el estado actual del checker (seguidos, seguidores, unfollows…)",
+            "type": 1,
+        },
+        {
+            "name": "check",
+            "description": "Fuerza una comprobación manual ahora mismo",
+            "type": 1,
+        },
+    ]
+
+    async def _register_commands(self) -> None:
+        """Registra los slash commands (sobreescribe los existentes)."""
+        if not self.app_id:
+            return
+        await self._rest(
+            "PUT",
+            f"/applications/{self.app_id}/commands",
+            json=self.SLASH_COMMANDS,
+        )
+        log.info("Slash commands registrados (/status, /check).")
+
+    async def _handle_interaction(self, interaction: dict) -> None:
+        """Despacha una interacción de slash command."""
+        name = interaction.get("data", {}).get("name", "")
+        if name == "status":
+            await self._cmd_status(interaction)
+        elif name == "check":
+            await self._cmd_check(interaction)
+        else:
+            await self._respond(interaction, content="Comando desconocido.")
+
+    async def _respond(self, interaction: dict, *,
+                       content: str = "", embeds: list | None = None,
+                       flags: int = 0) -> None:
+        """Responde a una interacción (debe llegar en <3 s)."""
+        data: dict = {}
+        if content:
+            data["content"] = content
+        if embeds:
+            data["embeds"] = embeds
+        if flags:
+            data["flags"] = flags
+        await self._rest(
+            "POST",
+            f"/interactions/{interaction['id']}/{interaction['token']}/callback",
+            json={"type": 4, "data": data},
+        )
+
+    async def _cmd_status(self, interaction: dict) -> None:
+        """Responde al comando /status con datos de la última comprobación."""
+        def _query():
+            row = self.conn.execute(
+                "SELECT following, followers, unfollows, started_at, finished_at "
+                "FROM checks WHERE ok = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            total = self.conn.execute(
+                "SELECT COUNT(*) FROM checks WHERE ok = 1"
+            ).fetchone()[0]
+            return row, total
+
+        try:
+            row, total = await asyncio.to_thread(_query)
+        except Exception as exc:
+            await self._respond(interaction, content=f"Error consultando la BD: {exc}")
+            return
+
+        if not row:
+            await self._respond(interaction,
+                                content="Aún no hay ninguna comprobación completada.")
+            return
+
+        following, followers, unfollows, started, finished = row
+
+        # Calcular antigüedad del último chequeo
+        try:
+            fin_dt = datetime.fromisoformat(finished)
+            delta = datetime.now(timezone.utc) - fin_dt
+            mins = int(delta.total_seconds() / 60)
+            if mins < 60:
+                elapsed = f"hace {mins} min"
+            elif mins < 1440:
+                elapsed = f"hace {mins // 60}h {mins % 60}min"
+            else:
+                elapsed = f"hace {mins // 1440}d"
+        except Exception:
+            elapsed = finished
+
+        next_check = self.cfg["interval_hours"]
+
+        embed = {
+            "title": "📊 Estado de Instagram Checker",
+            "color": 0x5865F2,  # blurple
+            "fields": [
+                {"name": "👤 Seguidos", "value": str(following), "inline": True},
+                {"name": "👥 Seguidores", "value": str(followers), "inline": True},
+                {"name": "🚫 Unfollows (último chequeo)", "value": str(unfollows), "inline": True},
+                {"name": "📅 Último chequeo", "value": elapsed, "inline": True},
+                {"name": "⏰ Próximo chequeo", "value": f"~{next_check:.0f} h", "inline": True},
+                {"name": "🔁 Total comprobaciones", "value": str(total), "inline": True},
+            ],
+        }
+        await self._respond(interaction, embeds=[embed])
+
+    def _run_check(self) -> None:
+        """Ejecuta run_once bajo lock (seguro para llamar desde otros hilos)."""
+        with _check_lock:
+            run_once(self.conn, self.cfg)
+
+    async def _cmd_check(self, interaction: dict) -> None:
+        """Responde al comando /check y lanza una comprobación manual."""
+        await self._respond(interaction,
+                            content="⏳ Comprobación manual en curso…",
+                            flags=64)  # EPHEMERAL
+        # Ejecutar run_once en el hilo principal
+        try:
+            await asyncio.to_thread(self._run_check)
+            def _query():
+                row = self.conn.execute(
+                    "SELECT following, followers, unfollows FROM checks "
+                    "WHERE ok = 1 ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                return row
+            row = await asyncio.to_thread(_query)
+            if row:
+                following, followers, unfollows = row
+                msg = (
+                    f"✅ Comprobación completada.\n"
+                    f"👤 Seguidos: **{following}** · "
+                    f"👥 Seguidores: **{followers}** · "
+                    f"🚫 Unfollows nuevos: **{unfollows}**"
+                )
+            else:
+                msg = "✅ Comprobación completada (sin datos)."
+            # Editar la respuesta original
+            await self._rest(
+                "PATCH",
+                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
+                json={"content": msg},
+            )
+        except Exception as exc:
+            await self._rest(
+                "PATCH",
+                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
+                json={"content": f"❌ Error: {exc}"},
+            )
 
 
 def update_bot_presence(following: int = 0, followers: int = 0,
@@ -694,12 +877,12 @@ def main() -> None:
                   ", ".join(k.upper() for k in missing))
         sys.exit(2)
 
-    conn = db_connect(cfg["db_file"])
+    conn = db_connect(cfg["db_file"], check_same_thread=False)
 
-    # Iniciar el Gateway de Discord para Rich Presence (en segundo plano).
+    # Iniciar el Gateway de Discord para Rich Presence y slash commands.
     global _gateway
     try:
-        _gateway = DiscordGateway(cfg["discord_token"])
+        _gateway = DiscordGateway(cfg["discord_token"], conn, cfg)
         _gateway.start()
     except Exception as exc:
         log.warning("No se pudo iniciar el Gateway de Discord (%s). "
@@ -708,7 +891,8 @@ def main() -> None:
     # Modo manual: una sola pasada (genera session.json la primera vez).
     if args.once:
         try:
-            run_once(conn, cfg)
+            with _check_lock:
+                run_once(conn, cfg)
         except Exception:
             log.exception("Fallo en la comprobación manual")
             sys.exit(1)
@@ -722,7 +906,8 @@ def main() -> None:
     while True:
         started = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
-            run_once(conn, cfg)
+            with _check_lock:
+                run_once(conn, cfg)
         except Exception as exc:
             # Problemas de conexión, login o API: avisa por Discord y reintenta
             # en el siguiente ciclo (sin spam: solo la primera caída seguida).
