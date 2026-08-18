@@ -346,6 +346,8 @@ def fetch_account_list(cl: Client, user_id: str, kind: str) -> dict:
         data = cl.user_following(user_id, amount=0)
     else:
         data = cl.user_followers(user_id, amount=0)
+    log.info("API de Instagram devolvió %d %s (dict final).",
+             len(data), "seguidos" if kind == "following" else "seguidores")
     return {u.username: str(u.pk) for u in data.values()}
 
 
@@ -366,6 +368,14 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
 
     cl = login_instagram(cfg)
     user_id = str(cl.user_id or cl.account_info().pk)
+
+    # Comparar con lo que Instagram muestra en el perfil.
+    try:
+        ai = cl.account_info()
+        log.info("Perfil Instagram: %d seguidores, %d seguidos (según profile).",
+                 ai.follower_count, ai.following_count)
+    except Exception:
+        log.debug("No se pudo obtener account_info() para comparar.")
 
     log.info("Obteniendo lista de cuentas que sigues…")
     following = fetch_account_list(cl, user_id, "following")
@@ -653,20 +663,41 @@ class DiscordGateway:
 
     # -- REST helper --------------------------------------------------------
 
-    async def _rest(self, method: str, path: str, **kw):
-        """Llamada REST a la API de Discord (en un hilo para no bloquear)."""
+    async def _rest(self, method: str, path: str, *, retries: int = 3, **kw):
+        """Llamada REST a la API de Discord (en un hilo para no bloquear).
+        Reintenta ante errores de red/DNS transitorios."""
         url = f"https://discord.com/api/v10{path}"
         headers = {"Authorization": f"Bot {self.token}"}
 
         def _do():
-            resp = requests.request(method, url, headers=headers, timeout=10, **kw)
-            if resp.status_code < 300:
+            last_exc = None
+            for attempt in range(1, retries + 1):
                 try:
-                    return resp.json()
-                except ValueError:
-                    return {}
-            log.debug("Discord REST %s %s → %s", method, path, resp.status_code)
-            return None
+                    resp = requests.request(method, url, headers=headers,
+                                            timeout=10, **kw)
+                    if resp.status_code < 300:
+                        try:
+                            return resp.json()
+                        except ValueError:
+                            return {}
+                    if resp.status_code < 500 and attempt == retries:
+                        log.debug("Discord REST %s %s → %s", method, path,
+                                  resp.status_code)
+                        return None
+                    if resp.status_code >= 500 and attempt < retries:
+                        time.sleep(1 * attempt)
+                        continue
+                    return None
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    last_exc = exc
+                    if attempt < retries:
+                        log.debug("Discord REST %s %s falló (intento %d/%d): %s",
+                                  method, path, attempt, retries, exc)
+                        time.sleep(1 * attempt)
+                        continue
+                    log.warning("Discord REST %s %s falló tras %d intentos: %s",
+                                method, path, retries, last_exc)
+                    return None
 
         return await asyncio.to_thread(_do)
 
@@ -698,13 +729,22 @@ class DiscordGateway:
 
     async def _handle_interaction(self, interaction: dict) -> None:
         """Despacha una interacción de slash command."""
-        name = interaction.get("data", {}).get("name", "")
-        if name == "status":
-            await self._cmd_status(interaction)
-        elif name == "check":
-            await self._cmd_check(interaction)
-        else:
-            await self._respond(interaction, content="Comando desconocido.")
+        try:
+            name = interaction.get("data", {}).get("name", "")
+            if name == "status":
+                await self._cmd_status(interaction)
+            elif name == "check":
+                await self._cmd_check(interaction)
+            else:
+                await self._respond(interaction, content="Comando desconocido.")
+        except Exception as exc:
+            log.warning("Error manejando interacción %s: %s",
+                        interaction.get("id", "?"), exc)
+            try:
+                await self._respond(interaction,
+                                    content="Error interno al procesar el comando.")
+            except Exception:
+                pass
 
     async def _respond(self, interaction: dict, *,
                        content: str = "", embeds: list | None = None,
