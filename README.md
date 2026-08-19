@@ -26,7 +26,7 @@ la sesión automáticamente.
 | `Dockerfile`       | Imagen `python:3.13-slim` (basada en Debian 13/Trixie), usuario sin privilegios, FS raíz de solo lectura |
 | `docker-compose.yml` | Límites de CPU/RAM, volumen persistente `checker-data:/data`, hardening |
 | `requirements.txt` | `instagrapi` (sin extras pesados), `requests` y `websockets` (Gateway de Discord) |
-| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence en tiempo real |
+| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence y comandos slash |
 | `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
@@ -49,7 +49,11 @@ la sesión automáticamente.
    (seguidos/seguidores) y un cronómetro en tiempo real desde el último chequeo.
    Al detectar un unfollow se muestra brevemente el username antes de volver
    a los conteos.
-8. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
+8. **Al reiniciar** no pide nada a Instagram: consulta la BD, ve cuándo fue el
+   último chequeo exitoso y, si no toca aún, duerme hasta el siguiente horario
+   (evita peticiones innecesarias al reiniciar el servidor). La Rich Presence
+   inicial también se carga desde la BD.
+9. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
 
 ## Comandos slash de Discord
 
@@ -95,7 +99,8 @@ Importante:
    clic derecho sobre el canal → *Copiar ID del canal* → `DISCORD_CHANNEL_ID`.
 
 > **Nota:** el bot muestra Rich Presence en tiempo real automáticamente (no
-> necesita permisos extra ni configuración en el Developer Portal).
+> necesita permisos extra ni configuración en el Developer Portal). Al arrancar
+> carga los últimos datos desde la BD en vez de esperar al primer chequeo.
 
 ## 2. Instalar Docker en Debian 13 (Trixie)
 
@@ -157,7 +162,7 @@ contraseña (y el código 2FA/seed si hiciera falta) temporalmente y reinicia.
 
 ```bash
 docker compose logs -f            # seguir los logs
-docker compose restart            # reiniciar
+docker compose restart            # reiniciar (no fuerza un chequeo inmediato)
 docker compose down               # parar (conserva el volumen de datos)
 
 # Backup del estado (session.json + audit.db)
@@ -166,6 +171,9 @@ docker run --rm \
   -v "$PWD":/backup alpine \
   sh -c "tar czf /backup/backup-$(date +%F).tar.gz -C /data ."
 ```
+
+Al reiniciar, el contenedor **no** pide datos a Instagram de inmediato: espera
+hasta que toque el siguiente chequeo según el último registro en la BD.
 
 ## 6. Solución de problemas
 
