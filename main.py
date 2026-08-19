@@ -502,13 +502,6 @@ _gateway: DiscordGateway | None = None  # instancia global (ver más abajo)
 _check_lock = threading.Lock()  # evita que run_once se ejecute en paralelo
 
 
-def _fmt_elapsed(seconds: float) -> str:
-    """Devuelve 'HH:MM:SS' transcurridos."""
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 class DiscordGateway:
     """Mantiene una conexión WebSocket al Gateway de Discord en un hilo
     dedicado, para enviar actualizaciones de presencia en tiempo real."""
@@ -680,13 +673,18 @@ class DiscordGateway:
                             return resp.json()
                         except ValueError:
                             return {}
-                    if resp.status_code < 500 and attempt == retries:
-                        log.debug("Discord REST %s %s → %s", method, path,
-                                  resp.status_code)
-                        return None
+                    # 429 Rate Limit: esperar y reintentar
+                    if resp.status_code == 429 and attempt < retries:
+                        retry_after = resp.json().get("retry_after", 2)
+                        log.warning("Discord rate-limit en %s %s, esperando %.1fs",
+                                    method, path, retry_after)
+                        time.sleep(retry_after)
+                        continue
                     if resp.status_code >= 500 and attempt < retries:
                         time.sleep(1 * attempt)
                         continue
+                    log.debug("Discord REST %s %s → %s", method, path,
+                              resp.status_code)
                     return None
                 except (requests.ConnectionError, requests.Timeout) as exc:
                     last_exc = exc
@@ -942,6 +940,27 @@ def main() -> None:
         "Bucle iniciado: comprobación cada ~%.1f h (+jitter de hasta %.0f min).",
         cfg["interval_hours"], cfg["jitter_minutes"],
     )
+
+    # Retomar desde el último chequeo: evitar peticiones al reiniciar.
+    def _last_check():
+        row = conn.execute(
+            "SELECT finished_at FROM checks WHERE ok = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+
+    last_finished = _last_check()
+    if last_finished:
+        try:
+            last_dt = datetime.fromisoformat(last_finished)
+            elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            interval = cfg["interval_hours"] * 3600 + random.uniform(0, cfg["jitter_minutes"] * 60)
+            remaining = interval - elapsed
+            if remaining > 0:
+                log.info("Último chequeo hace %.0f min. Siguiente en %.1f min.",
+                         elapsed / 60, remaining / 60)
+                time.sleep(remaining)
+        except Exception:
+            pass  # Si falla el parseo, se ejecuta de inmediato
 
     while True:
         started = datetime.now(timezone.utc).isoformat(timespec="seconds")
