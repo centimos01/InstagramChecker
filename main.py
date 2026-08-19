@@ -586,7 +586,24 @@ class DiscordGateway:
             self.app_id = me["id"]
             await self._register_commands()
 
-        # 4) Enviar presencia inicial
+        # 4) Cargar estado de la BD y enviar presencia inicial
+        def _load():
+            row = self.conn.execute(
+                "SELECT following, followers, finished_at FROM checks "
+                "WHERE ok = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            return (row["following"], row["followers"], row["finished_at"]) if row else None
+
+        try:
+            data = await asyncio.to_thread(_load)
+            if data:
+                following, followers, finished_at = data
+                fin_dt = datetime.fromisoformat(finished_at)
+                self._presence_state = f"{following} seguidos · {followers} seguidores"
+                self._presence_details = "Último chequeo"
+                self._presence_ts = fin_dt.timestamp()
+        except Exception:
+            pass
         await self._send_presence()
 
         # 4) Heartbeat + escuchar en paralelo
