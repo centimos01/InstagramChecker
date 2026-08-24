@@ -1,8 +1,9 @@
 # AGENTS.md — InstagramChecker
 
 Instagram unfollower auditor: a Docker container that compares following/followers
-(SQLite WAL) and alerts via Discord. The project's user-facing content is in Spanish
-(README, logs, messages); keep that language in output.
+(SQLite WAL) and alerts via Discord. Checks are triggered manually via Discord
+slash commands (`/check`, `/status`), NOT on a timer. The project's user-facing
+content is in Spanish (README, logs, messages); keep that language in output.
 
 > IMPORTANT: the end user speaks Spanish. Always reply to the user in Spanish, even
 > though this file is written in English. Code comments, log messages and Discord
@@ -53,6 +54,21 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
 - The base install is lightweight (moviepy/numpy only live in the `video` extra): do not
   add extras or `instagrapi[full]`.
 
+## Architecture
+
+- Single Python process (`main.py`), no web framework.
+- **No automatic timer loop**: checks are triggered manually via Discord slash
+  commands (`/check`) or CLI (`--once`). The bot sits idle waiting for commands.
+- Discord Gateway connection (`websockets` library) runs in a daemon thread, handles:
+  - Rich Presence updates (follower/following counts, elapsed time since last check)
+  - Slash command registration and interaction handling (`/status`, `/check`)
+- Thread safety: `_check_lock` (threading.Lock) prevents concurrent `run_once`
+  calls. The shared SQLite connection uses `check_same_thread=False` (safe with WAL).
+- `_rest` helper for Discord REST API with retry logic (3 attempts, backoff for
+  5xx and DNS failures, respects 429 `retry_after`).
+- On startup, loads last check data from DB into Rich Presence (no need to wait
+  for first `/check`).
+
 ## Data, compose and operation
 
 - Persistent state in named volume `checker-data:/data` (`session.json` + `audit.db` WAL),
@@ -61,7 +77,15 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
   `deploy.resources`). `read_only: true` + `tmpfs /tmp`: any write outside `/data` or
   `/tmp` fails.
 - main.py: single entry point, 100% env-var config; only flags `--once` and `--debug`.
-  In loop mode it sleeps `CHECK_INTERVAL_HOURS` + jitter.
-- Do not lower `CHECK_INTERVAL_HOURS` below ~4 h (risk of Meta rate-limit/ban).
+  No automatic loop — all checks are on-demand via Discord or `--once`.
 - Never commit `.env` or `session.json` (`.dockerignore` already excludes them from the
   build context).
+
+## Discord Gateway details
+
+- Uses `websockets` (pinned `>=13.0,<14`) for the Gateway WebSocket connection.
+- Slash commands (`/status`, `/check`) are registered globally on each connect.
+  The `application_id` is obtained from `GET /users/@me` (same as bot user ID).
+- Interaction responses use the REST API callback endpoint, not Gateway responses.
+- The Gateway thread reconnects automatically on disconnect (5s delay).
+- Rate limiting (429) is handled with `retry_after` from the response body.

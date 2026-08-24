@@ -20,13 +20,10 @@ Arquitectura
   snapshot actual de "seguidos" y "seguidores", se compara contra lo que hay
   en base de datos y se registra el histórico de unfollows (con detección de
   "volvieron a seguirte" para avisar de nuevo si te vuelven a dejar).
-* Bucle en segundo plano con intervalo configurable + jitter aleatorio para
-  comportarse de forma orgánica.
+* Comandos slash de Discord (/check, /status) para lanzar comprobaciones bajo
+  demanda. Rich Presence en tiempo real con los conteos actualizados.
 * Si un ciclo falla (red, login o API de Instagram) se envía un aviso de error
-  a Discord y se reintenta en el siguiente ciclo; solo se alerta la primera
-  caída seguida para no saturar el canal.
-* Rich Presence en tiempo real: el bot muestra en Discord los conteos actualizados
-  de seguidos/seguidores y el último chequeo, actualizado en cada ciclo.
+  a Discord.
 
 Variables de entorno: ver .env.example.
 """
@@ -66,13 +63,6 @@ def env_str(name: str, default: str = "") -> str:
     """Lee una variable de entorno o devuelve el valor por defecto."""
     return os.getenv(name, "").strip() or default
 
-
-def env_float(name: str, default: float) -> float:
-    """Lee un número flotante de entorno; ante valor inválido, usa el default."""
-    try:
-        return float(os.getenv(name, ""))
-    except ValueError:
-        return default
 
 
 # ---------------------------------------------------------------------------
@@ -817,8 +807,6 @@ class DiscordGateway:
         except Exception:
             elapsed = finished
 
-        next_check = self.cfg["interval_hours"]
-
         embed = {
             "title": "📊 Estado de Instagram Checker",
             "color": 0x5865F2,  # blurple
@@ -827,7 +815,6 @@ class DiscordGateway:
                 {"name": "👥 Seguidores", "value": str(followers), "inline": True},
                 {"name": "🚫 Unfollows (último chequeo)", "value": str(unfollows), "inline": True},
                 {"name": "📅 Último chequeo", "value": elapsed, "inline": True},
-                {"name": "⏰ Próximo chequeo", "value": f"~{next_check:.0f} h", "inline": True},
                 {"name": "🔁 Total comprobaciones", "value": str(total), "inline": True},
             ],
         }
@@ -922,8 +909,6 @@ def main() -> None:
         "discord_channel": env_str("DISCORD_CHANNEL_ID"),
         "session_file": env_str("SESSION_FILE", "/data/session.json"),
         "db_file": env_str("DB_FILE", "/data/audit.db"),
-        "interval_hours": env_float("CHECK_INTERVAL_HOURS", 6.0),
-        "jitter_minutes": env_float("JITTER_MINUTES", 30.0),
     }
 
     missing = [k for k in ("username", "discord_token", "discord_channel") if not cfg[k]]
@@ -933,15 +918,6 @@ def main() -> None:
         sys.exit(2)
 
     conn = db_connect(cfg["db_file"], check_same_thread=False)
-
-    # Iniciar el Gateway de Discord para Rich Presence y slash commands.
-    global _gateway
-    try:
-        _gateway = DiscordGateway(cfg["discord_token"], conn, cfg)
-        _gateway.start()
-    except Exception as exc:
-        log.warning("No se pudo iniciar el Gateway de Discord (%s). "
-                    "Rich Presence deshabilitado.", exc)
 
     # Modo manual: una sola pasada (genera session.json la primera vez).
     if args.once:
@@ -953,50 +929,22 @@ def main() -> None:
             sys.exit(1)
         return
 
-    log.info(
-        "Bucle iniciado: comprobación cada ~%.1f h (+jitter de hasta %.0f min).",
-        cfg["interval_hours"], cfg["jitter_minutes"],
-    )
+    # Iniciar el Gateway de Discord para Rich Presence y slash commands.
+    global _gateway
+    try:
+        _gateway = DiscordGateway(cfg["discord_token"], conn, cfg)
+        _gateway.start()
+    except Exception as exc:
+        log.warning("No se pudo iniciar el Gateway de Discord (%s). "
+                    "Rich Presence deshabilitado.", exc)
 
-    # Retomar desde el último chequeo: evitar peticiones al reiniciar.
-    def _last_check():
-        row = conn.execute(
-            "SELECT finished_at FROM checks WHERE ok = 1 ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row else None
-
-    last_finished = _last_check()
-    if last_finished:
-        try:
-            last_dt = datetime.fromisoformat(last_finished)
-            elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-            interval = cfg["interval_hours"] * 3600 + random.uniform(0, cfg["jitter_minutes"] * 60)
-            remaining = interval - elapsed
-            if remaining > 0:
-                log.info("Último chequeo hace %.0f min. Siguiente en %.1f min.",
-                         elapsed / 60, remaining / 60)
-                time.sleep(remaining)
-        except Exception:
-            pass  # Si falla el parseo, se ejecuta de inmediato
-
-    while True:
-        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        try:
-            with _check_lock:
-                run_once(conn, cfg)
-        except Exception as exc:
-            # Problemas de conexión, login o API: avisa por Discord y reintenta
-            # en el siguiente ciclo (sin spam: solo la primera caída seguida).
-            notify_failure(conn, cfg, exc, started)
-
-        # Espera = intervalo configurado + jitter aleatorio (comportamiento orgánico).
-        total = cfg["interval_hours"] * 3600 + random.uniform(0, cfg["jitter_minutes"] * 60)
-        log.info("Siguiente comprobación en %.1f minutos.", total / 60)
-        try:
-            time.sleep(total)
-        except KeyboardInterrupt:
-            log.info("Interrumpido. Saliendo…")
-            break
+    log.info("Esperando comandos de Discord (/check, /status)…")
+    # Mantener el proceso vivo; el Gateway corre en su propio hilo.
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("Interrumpido. Saliendo…")
 
 
 if __name__ == "__main__":

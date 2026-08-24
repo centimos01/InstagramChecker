@@ -5,9 +5,9 @@ detecta quién te ha dejado de seguir (usuarios a los que sigues pero que ya no 
 siguen de vuelta) y envía una alerta a un canal de Discord mediante un Bot.
 
 Stack: **Python 3.13 (Debian Trixie) + instagrapi + SQLite (WAL)**. Sin frameworks
-web, un único proceso con bucle de temporización + jitter aleatorio. Incluye
-**Rich Presence en tiempo real** en Discord (contadores actualizados de seguidos
-y seguidores).
+web, un único proceso con comandos slash de Discord para lanzar comprobaciones
+bajo demanda. Incluye **Rich Presence en tiempo real** y comandos `/status`
+y `/check`.
 
 Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimos01/InstagramChecker)
 
@@ -30,30 +30,30 @@ la sesión automáticamente.
 | `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
-## Qué hace `main.py` en cada ciclo
+## Qué hace `main.py`
+
+El bot se mantiene en espera con el Gateway de Discord conectado. Las
+comprobaciones **no se ejecutan automáticamente**: se lanzan solo cuando
+el usuario lo pide.
 
 1. Carga `session.json` (si existe y es válida) para **no** usar la contraseña
    cada vez → menos riesgo de baneo/rate-limit de Meta.
-2. Descarga la lista de **seguidos** y de **seguidores** (todas las páginas),
-   con una pausa aleatoria de 30–90 s entre ambas llamadas.
+2. Al ejecutar `/check` (o `--once` desde la CLI), descarga la lista de
+   **seguidos** y de **seguidores** (todas las páginas), con una pausa
+   aleatoria de 30–90 s entre ambas llamadas.
 3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
 4. Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord
    con **todos** los usernames (sin truncar). Si la lista es muy larga se
    divide automáticamente en varios embeds en el mismo mensaje.
 5. Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
 6. Si un ciclo falla (problema de red, login o API de Instagram), envía un
-   aviso de **error** al canal de Discord y reintenta en el siguiente ciclo.
-   Para no saturar el canal solo alerta la primera caída seguida; cuando el
-   servicio se recupera vuelve a avisar si algo vuelve a fallar.
+   aviso de **error** al canal de Discord.
 7. Actualiza la **Rich Presence** del bot en Discord con los conteos actualizados
    (seguidos/seguidores) y un cronómetro en tiempo real desde el último chequeo.
    Al detectar un unfollow se muestra brevemente el username antes de volver
    a los conteos.
-8. **Al reiniciar** no pide nada a Instagram: consulta la BD, ve cuándo fue el
-   último chequeo exitoso y, si no toca aún, duerme hasta el siguiente horario
-   (evita peticiones innecesarias al reiniciar el servidor). La Rich Presence
-   inicial también se carga desde la BD.
-9. Duerme el intervalo configurado (`CHECK_INTERVAL_HOURS`) + jitter aleatorio.
+8. Al arrancar carga los últimos datos desde la BD en la Rich Presence (sin
+   esperar a la primera comprobación).
 
 ## Comandos slash de Discord
 
@@ -61,11 +61,12 @@ El bot registra automáticamente estos comandos al iniciar:
 
 | Comando | Descripción |
 |---------|-------------|
-| `/status` | Muestra seguidos, seguidores, unfollows del último chequeo, próximo chequeo y total de comprobaciones |
-| `/check` | Fuerza una comprobación manual (misma lógica que `--once` pero sin reiniciar el contenedor) |
+| `/status` | Muestra seguidos, seguidores, unfollows del último chequeo y total de comprobaciones |
+| `/check` | Lanza una comprobación manual (descarga seguidos/seguidores, compara y alerta si hay unfollows nuevos) |
 
 Los comandos se registran globalmente al conectar al Gateway y están disponibles
-en todos los servidores donde esté el bot.
+en todos los servidores donde esté el bot. Las comprobaciones **solo** se ejecutan
+cuando se usa `/check` o `--once` desde la CLI del contenedor.
 
 ## Desplegar en otra máquina
 
@@ -162,7 +163,7 @@ contraseña (y el código 2FA/seed si hiciera falta) temporalmente y reinicia.
 
 ```bash
 docker compose logs -f            # seguir los logs
-docker compose restart            # reiniciar (no fuerza un chequeo inmediato)
+docker compose restart            # reiniciar
 docker compose down               # parar (conserva el volumen de datos)
 
 # Backup del estado (session.json + audit.db)
@@ -172,8 +173,8 @@ docker run --rm \
   sh -c "tar czf /backup/backup-$(date +%F).tar.gz -C /data ."
 ```
 
-Al reiniciar, el contenedor **no** pide datos a Instagram de inmediato: espera
-hasta que toque el siguiente chequeo según el último registro en la BD.
+Las comprobaciones se lanzan con `/check` desde Discord o con
+`docker compose exec instagram-checker python main.py --once`.
 
 ## 6. Solución de problemas
 
@@ -187,14 +188,16 @@ hasta que toque el siguiente chequeo según el último registro en la BD.
   `INSTAGRAM_2FA_CODE` a `.env` (ver sección 4) y reinicia.
 - **Instagram pide verificación manual (`ChallengeRequired`)** → entra en la app
   o web de Instagram **desde la IP del servidor**, confirma la sesión, y deja de
-  ejecutar unas horas. Respeta un intervalo mínimo de **4 h** (default: 6 h).
+  ejecutar unas horas antes de volver a intentar.
+- **Los comandos slash no aparecen** → verifica que invitaste al bot con scope
+  `applications.commands` en OAuth2.
 - **`websockets` no instalado / Gateway no arranca** → la presencia del bot no
   se actualiza pero el servicio funciona normal. Reinstala dependencias:
   `docker compose up -d --build`.
 
 ## Notas de uso responsable
 
-Audita **solo tu propia cuenta**. Reducir el intervalo por debajo de ~4 h o
-lanzar comprobaciones muy seguidas aumenta el riesgo de que Meta marque la
-cuenta como sospechosa. Los retardos aleatorios ya incluidos (jitter + pausas)
-están pensados para comportarse de forma orgánica.
+Audita **solo tu propia cuenta**. Lanzar comprobaciones muy seguidas (más de
+una cada pocas horas) aumenta el riesgo de que Meta marque la cuenta como
+sospechosa. Las pausas aleatorias entre llamadas ya incluidas están pensadas
+para comportarse de forma orgánica.
