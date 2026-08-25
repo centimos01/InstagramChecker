@@ -1084,7 +1084,9 @@ class DiscordGateway:
         await self._respond(interaction, content="⏳ Reseteando base de datos…")
         try:
             def _reset():
-                self.conn.execute("DELETE FROM snapshots")
+                self.conn.execute("DELETE FROM following")
+                self.conn.execute("DELETE FROM followers")
+                self.conn.execute("DELETE FROM unfollowers")
                 self.conn.execute("DELETE FROM checks")
                 self.conn.commit()
             await asyncio.to_thread(_reset)
