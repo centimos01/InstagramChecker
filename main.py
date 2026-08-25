@@ -369,18 +369,23 @@ def _extract_usernames(data) -> list[str]:
     """Extrae usernames de varios formatos de Instagram Data Download."""
     usernames = []
     if isinstance(data, dict):
-        # Formato antiguo: {"relationships_following": [{"string_list_data": [...]}]}
-        items = data.get("relationships_following", data.get("string_list_data", []))
+        items = data.get("relationships_following",
+                         data.get("followers", data.get("string_list_data", [])))
         if isinstance(items, list):
             for item in items:
                 if isinstance(item, dict):
+                    # Formato nuevo: username en "title"
+                    if item.get("title"):
+                        usernames.append(item["title"])
+                    # Formato clásico: username en string_list_data[].value
                     for entry in item.get("string_list_data", []):
                         if entry.get("value"):
                             usernames.append(entry["value"])
     elif isinstance(data, list):
-        # Formato nuevo: lista directa
         for item in data:
             if isinstance(item, dict):
+                if item.get("title"):
+                    usernames.append(item["title"])
                 for entry in item.get("string_list_data", []):
                     if entry.get("value"):
                         usernames.append(entry["value"])
