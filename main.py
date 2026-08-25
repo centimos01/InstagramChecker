@@ -400,6 +400,8 @@ def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
 
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
+        log.info("ZIP: %d archivos: %s", len(names),
+                 [n for n in names if "follower" in n.lower() or "following" in n.lower()])
 
         for name in names:
             if name.endswith("following.json"):
@@ -417,8 +419,13 @@ def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
         for name in sorted(names):
             if re.search(r'followers[_-]?\d*\.json$', name):
                 try:
-                    data = json.loads(zf.read(name))
-                    for u in _extract_usernames(data):
+                    raw = json.loads(zf.read(name))
+                    log.info("ZIP: %s tipo=%s, longitud=%d",
+                             name, type(raw).__name__,
+                             len(raw) if isinstance(raw, (list, dict)) else 0)
+                    if isinstance(raw, (list, dict)) and len(raw) > 0:
+                        log.info("ZIP: %s muestra: %s", name, str(raw)[:500])
+                    for u in _extract_usernames(raw):
                         followers[u] = ""
                     log.info("ZIP: +seguidores desde %s (total: %d)", name, len(followers))
                 except (json.JSONDecodeError, KeyError):
