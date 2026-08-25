@@ -192,8 +192,8 @@ def compute_new_unfollows(conn: sqlite3.Connection, following: dict, followers: 
 # ---------------------------------------------------------------------------
 
 DISCORD_API = "https://discord.com/api/v10"
-EMBED_DESC_LIMIT = 4096
-MAX_EMBEDS_PER_MSG = 10
+EMBED_DESC_LIMIT = 1800
+MAX_EMBEDS_PER_MSG = 3
 
 
 def discord_embed(token: str, channel_id: str, title: str, description: str,
