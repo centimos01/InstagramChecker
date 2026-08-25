@@ -329,15 +329,29 @@ def login_instagram(cfg: dict) -> Client:
     return cl
 
 
-def fetch_account_list(cl: Client, user_id: str, kind: str) -> dict:
+def fetch_account_list(cl: Client, user_id: str, kind: str,
+                       expected: int = 0) -> dict:
     """Obtiene 'following' o 'followers' completo (amount=0 => todas las páginas).
-    Devuelve {username: user_id}."""
-    if kind == "following":
-        data = cl.user_following(user_id, amount=0)
-    else:
-        data = cl.user_followers(user_id, amount=0)
-    log.info("API de Instagram devolvió %d %s (dict final).",
-             len(data), "seguidos" if kind == "following" else "seguidores")
+    Devuelve {username: user_id}. Si 'expected' > 0 y el resultado difiere,
+    reintenta una vez con use_cache=False y pausa más larga."""
+    label = "seguidos" if kind == "following" else "seguidores"
+
+    for attempt in range(1, 3):
+        if kind == "following":
+            data = cl.user_following(user_id, amount=0, use_cache=(attempt == 1))
+        else:
+            data = cl.user_followers(user_id, amount=0, use_cache=(attempt == 1))
+        count = len(data)
+        log.info("API devolvió %d %s (intento %d, use_cache=%s).",
+                 count, label, attempt, attempt == 1)
+
+        if expected <= 0 or abs(count - expected) <= 1 or attempt == 2:
+            break
+
+        log.warning("Discrepancia: API devuelve %d pero profile dice %d. "
+                    "Reintentando con pausa…", count, expected)
+        time.sleep(random.uniform(15, 30))
+
     return {u.username: str(u.pk) for u in data.values()}
 
 
@@ -359,7 +373,8 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
     cl = login_instagram(cfg)
     user_id = str(cl.user_id or cl.account_info().pk)
 
-    # Comparar con lo que Instagram muestra en el perfil.
+    # Obtener counts reales del perfil para validar los resultados de la API.
+    ai = None
     try:
         ai = cl.account_info()
         log.info("Perfil Instagram: %d seguidores, %d seguidos (según profile).",
@@ -368,7 +383,8 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
         log.debug("No se pudo obtener account_info() para comparar.")
 
     log.info("Obteniendo lista de cuentas que sigues…")
-    following = fetch_account_list(cl, user_id, "following")
+    following = fetch_account_list(cl, user_id, "following",
+                                   expected=ai.following_count if ai else 0)
     log.info("Seguidos: %d", len(following))
 
     # Pausa aleatoria entre las dos llamadas grandes: comportamiento orgánico
@@ -376,7 +392,8 @@ def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
     time.sleep(random.uniform(30, 90))
 
     log.info("Obteniendo lista de tus seguidores…")
-    followers = fetch_account_list(cl, user_id, "followers")
+    followers = fetch_account_list(cl, user_id, "followers",
+                                   expected=ai.follower_count if ai else 0)
     log.info("Seguidores: %d", len(followers))
 
     # ---- Persistir el estado de esta ejecución (ambas listas obtenidas). ----
