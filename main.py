@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 import threading
@@ -364,35 +365,51 @@ def fetch_account_list(cl: Client, user_id: str, kind: str,
 # ---------------------------------------------------------------------------
 
 
+def _extract_usernames(data) -> list[str]:
+    """Extrae usernames de varios formatos de Instagram Data Download."""
+    usernames = []
+    if isinstance(data, dict):
+        # Formato antiguo: {"relationships_following": [{"string_list_data": [...]}]}
+        items = data.get("relationships_following", data.get("string_list_data", []))
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    for entry in item.get("string_list_data", []):
+                        if entry.get("value"):
+                            usernames.append(entry["value"])
+    elif isinstance(data, list):
+        # Formato nuevo: lista directa
+        for item in data:
+            if isinstance(item, dict):
+                for entry in item.get("string_list_data", []):
+                    if entry.get("value"):
+                        usernames.append(entry["value"])
+    return usernames
+
+
 def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
     """Parsea un ZIP de Instagram Data Download.
-    Devuelve (following_dict, followers_dict) como {username: ""}.
-    Busca following.json y followers_1.json (o followers_2.json, etc.)."""
+    Devuelve (following_dict, followers_dict) como {username: ""}."""
     following = {}
     followers = {}
 
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
 
-        # Buscar following.json (puede estar en subcarpetas)
         for name in names:
             if name.endswith("following.json"):
                 data = json.loads(zf.read(name))
-                for item in data.get("relationships_following", []):
-                    for entry in item.get("string_list_data", []):
-                        if entry.get("value"):
-                            following[entry["value"]] = ""
+                for u in _extract_usernames(data):
+                    following[u] = ""
                 log.info("ZIP: %d seguidos encontrados en %s", len(following), name)
                 break
 
-        # Buscar followers_1.json, followers_2.json, etc.
         for name in sorted(names):
-            if "followers" in name and name.endswith(".json") and "date" not in name.lower():
+            if re.search(r'followers[_-]?\d*\.json$', name):
                 try:
                     data = json.loads(zf.read(name))
-                    for entry in data.get("string_list_data", []):
-                        if entry.get("value"):
-                            followers[entry["value"]] = ""
+                    for u in _extract_usernames(data):
+                        followers[u] = ""
                     log.info("ZIP: +seguidores desde %s (total: %d)", name, len(followers))
                 except (json.JSONDecodeError, KeyError):
                     continue
