@@ -398,8 +398,13 @@ def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
 
         for name in names:
             if name.endswith("following.json"):
-                data = json.loads(zf.read(name))
-                for u in _extract_usernames(data):
+                raw = json.loads(zf.read(name))
+                log.info("ZIP: following.json tipo=%s, longitud=%d",
+                         type(raw).__name__, len(raw) if isinstance(raw, (list, dict)) else 0)
+                if isinstance(raw, (list, dict)):
+                    sample = str(raw)[:500]
+                    log.info("ZIP: following.json muestra: %s", sample)
+                for u in _extract_usernames(raw):
                     following[u] = ""
                 log.info("ZIP: %d seguidos encontrados en %s", len(following), name)
                 break
