@@ -626,8 +626,12 @@ class DiscordGateway:
         self._presence_details = ""
         self._presence_ts: float | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="gateway")
-        # Intent GUILD_MESSAGES (1 << 9) para detectar ZIPs en el canal de importación.
-        self._intents = 512 if cfg.get("import_channel") else 0
+        # GUILD_MESSAGES (1 << 9) para detectar ZIPs; MESSAGE_CONTENT (1 << 15)
+        # para recibir el contenido de los mensajes (adjuntos).
+        if cfg.get("import_channel"):
+            self._intents = (1 << 9) | (1 << 15)  # 33280
+        else:
+            self._intents = 0
 
     # -- Lifecycle ----------------------------------------------------------
 
