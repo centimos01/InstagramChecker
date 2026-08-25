@@ -875,6 +875,11 @@ class DiscordGateway:
             "description": "Fuerza una comprobación manual ahora mismo",
             "type": 1,
         },
+        {
+            "name": "reset",
+            "description": "Borra toda la base de datos y empieza desde cero",
+            "type": 1,
+        },
     ]
 
     async def _register_commands(self) -> None:
@@ -886,7 +891,7 @@ class DiscordGateway:
             f"/applications/{self.app_id}/commands",
             json=self.SLASH_COMMANDS,
         )
-        log.info("Slash commands registrados (/status, /check).")
+        log.info("Slash commands registrados (/status, /check, /reset).")
 
     async def _handle_interaction(self, interaction: dict) -> None:
         """Despacha una interacción de slash command."""
@@ -896,6 +901,8 @@ class DiscordGateway:
                 await self._cmd_status(interaction)
             elif name == "check":
                 await self._cmd_check(interaction)
+            elif name == "reset":
+                await self._cmd_reset(interaction)
             else:
                 await self._respond(interaction, content="Comando desconocido.")
         except Exception as exc:
@@ -1070,6 +1077,28 @@ class DiscordGateway:
                 "PATCH",
                 f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
                 json={"content": f"❌ Error: {exc}"},
+            )
+
+    async def _cmd_reset(self, interaction: dict) -> None:
+        """Borra toda la base de datos y reinicia la Rich Presence."""
+        await self._respond(interaction, content="⏳ Reseteando base de datos…")
+        try:
+            def _reset():
+                self.conn.execute("DELETE FROM snapshots")
+                self.conn.execute("DELETE FROM checks")
+                self.conn.commit()
+            await asyncio.to_thread(_reset)
+            update_bot_presence()
+            await self._rest(
+                "PATCH",
+                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
+                json={"content": "✅ Base de datos borrada. Todo desde cero."},
+            )
+        except Exception as exc:
+            await self._rest(
+                "PATCH",
+                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
+                json={"content": f"❌ Error al resetear: {exc}"},
             )
 
 
