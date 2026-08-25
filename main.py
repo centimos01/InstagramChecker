@@ -22,6 +22,8 @@ Arquitectura
   "volvieron a seguirte" para avisar de nuevo si te vuelven a dejar).
 * Comandos slash de Discord (/check, /status) para lanzar comprobaciones bajo
   demanda. Rich Presence en tiempo real con los conteos actualizados.
+* Importación por ZIP: monitoriza un canal de Discord para detectar ZIPs de
+  Instagram Data Download y comparar sin usar la API.
 * Si un ciclo falla (red, login o API de Instagram) se envía un aviso de error
   a Discord.
 
@@ -40,7 +42,9 @@ import sqlite3
 import sys
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone
+from io import BytesIO
 
 import requests
 from instagrapi import Client
@@ -356,6 +360,97 @@ def fetch_account_list(cl: Client, user_id: str, kind: str,
 
 
 # ---------------------------------------------------------------------------
+# Importación desde ZIP de Instagram (Data Download)
+# ---------------------------------------------------------------------------
+
+
+def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
+    """Parsea un ZIP de Instagram Data Download.
+    Devuelve (following_dict, followers_dict) como {username: ""}.
+    Busca following.json y followers_1.json (o followers_2.json, etc.)."""
+    following = {}
+    followers = {}
+
+    with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+
+        # Buscar following.json (puede estar en subcarpetas)
+        for name in names:
+            if name.endswith("following.json"):
+                data = json.loads(zf.read(name))
+                for item in data.get("relationships_following", []):
+                    for entry in item.get("string_list_data", []):
+                        if entry.get("value"):
+                            following[entry["value"]] = ""
+                log.info("ZIP: %d seguidos encontrados en %s", len(following), name)
+                break
+
+        # Buscar followers_1.json, followers_2.json, etc.
+        for name in sorted(names):
+            if "followers" in name and name.endswith(".json") and "date" not in name.lower():
+                try:
+                    data = json.loads(zf.read(name))
+                    for entry in data.get("string_list_data", []):
+                        if entry.get("value"):
+                            followers[entry["value"]] = ""
+                    log.info("ZIP: +seguidores desde %s (total: %d)", name, len(followers))
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+    if not following and not followers:
+        raise ValueError("No se encontraron following.json ni followers_*.json en el ZIP")
+    return following, followers
+
+
+def run_from_zip(conn: sqlite3.Connection, cfg: dict,
+                 following: dict, followers: dict) -> list:
+    """Ejecuta la comparación usando datos de un ZIP (misma lógica que run_once
+    pero sin llamar a la API de Instagram)."""
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    log.info("ZIP: %d seguidos, %d seguidores.", len(following), len(followers))
+
+    save_snapshot(conn, "following", following, started)
+    save_snapshot(conn, "followers", followers, started)
+
+    new_unfollows = compute_new_unfollows(conn, following, set(followers), started)
+
+    prune_old_snapshots(conn, "following", started)
+    prune_old_snapshots(conn, "followers", started)
+
+    finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO checks (started_at, finished_at, ok, following, followers, unfollows)
+           VALUES (?, ?, 1, ?, ?, ?)""",
+        (started, finished, len(following), len(followers), len(new_unfollows)),
+    )
+    conn.commit()
+
+    if new_unfollows:
+        update_bot_presence(len(following), len(followers), unfollow=new_unfollows[0])
+        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        footer = (
+            f"Importación ZIP · seguidos: {len(following)} "
+            f"· seguidores: {len(followers)}"
+        )
+        discord_embed(
+            cfg["discord_token"],
+            cfg["discord_channel"],
+            f"{len(new_unfollows)} nuevo(s) unfollow(s) detectado(s)",
+            format_list(new_unfollows),
+            0xED4245,
+            footer=footer,
+            timestamp=finished,
+        )
+        log.info("Enviadas alertas para %d unfollow(s) nuevos.", len(new_unfollows))
+    else:
+        log.info("Sin nuevos unfollows en esta importación.")
+
+    update_bot_presence(len(following), len(followers))
+    return new_unfollows
+
+
+# ---------------------------------------------------------------------------
 # Ciclo de auditoría
 # ---------------------------------------------------------------------------
 
@@ -531,6 +626,8 @@ class DiscordGateway:
         self._presence_details = ""
         self._presence_ts: float | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="gateway")
+        # Intent GUILD_MESSAGES (1 << 9) para detectar ZIPs en el canal de importación.
+        self._intents = 512 if cfg.get("import_channel") else 0
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -583,7 +680,7 @@ class DiscordGateway:
             "d": {
                 "token": self.token,
                 "properties": {"os": "linux", "browser": "python", "device": ""},
-                "intents": 0,
+                "intents": self._intents,
             },
         }))
 
@@ -638,6 +735,10 @@ class DiscordGateway:
                 # Slash commands
                 if op == 0 and msg.get("t") == "INTERACTION_CREATE":
                     asyncio.create_task(self._handle_interaction(msg["d"]))
+                # Importación de ZIP
+                if (op == 0 and msg.get("t") == "MESSAGE_CREATE"
+                        and self.cfg.get("import_channel")):
+                    asyncio.create_task(self._handle_message(msg["d"]))
         except websockets.ConnectionClosed:
             return
 
@@ -767,6 +868,59 @@ class DiscordGateway:
                                     content="Error interno al procesar el comando.")
             except Exception:
                 pass
+
+    async def _handle_message(self, msg: dict) -> None:
+        """Detecta ZIPs de Instagram en el canal de importación."""
+        channel_id = msg.get("channel_id")
+        if channel_id != self.cfg.get("import_channel"):
+            return
+        attachments = msg.get("attachments", [])
+        if not attachments:
+            return
+        for att in attachments:
+            filename = att.get("filename", "")
+            if not filename.lower().endswith(".zip"):
+                continue
+            log.info("ZIP detectado: %s (%d bytes)", filename, att.get("size", 0))
+            try:
+                # Descargar el adjunto
+                url = att.get("url")
+                if not url:
+                    continue
+                zip_bytes = await self._download(url)
+                if not zip_bytes:
+                    continue
+                # Parsear y comparar
+                following, followers = parse_instagram_zip(zip_bytes)
+                await asyncio.to_thread(run_from_zip, self.conn, self.cfg,
+                                        following, followers)
+                # Notificar éxito en el canal
+                await self._rest("POST", f"/channels/{channel_id}/messages",
+                                 json={
+                                     "content": (
+                                         f"✅ Importación completada: "
+                                         f"**{len(following)}** seguidos, "
+                                         f"**{len(followers)}** seguidores."
+                                     ),
+                                 })
+            except Exception as exc:
+                log.warning("Error procesando ZIP %s: %s", filename, exc)
+                try:
+                    await self._rest("POST", f"/channels/{channel_id}/messages",
+                                     json={"content": f"❌ Error al procesar el ZIP: {exc}"})
+                except Exception:
+                    pass
+
+    async def _download(self, url: str) -> bytes | None:
+        """Descarga un fichero desde Discord CDN (requiere auth)."""
+        def _do():
+            resp = requests.get(url, headers={"Authorization": f"Bot {self.token}"},
+                                timeout=30)
+            if resp.status_code < 300:
+                return resp.content
+            log.warning("Descarga fallida (%s): %s", url, resp.status_code)
+            return None
+        return await asyncio.to_thread(_do)
 
     async def _respond(self, interaction: dict, *,
                        content: str = "", embeds: list | None = None,
@@ -924,6 +1078,7 @@ def main() -> None:
         "twofa_code": env_str("INSTAGRAM_2FA_CODE"),
         "discord_token": env_str("DISCORD_BOT_TOKEN"),
         "discord_channel": env_str("DISCORD_CHANNEL_ID"),
+        "import_channel": env_str("DISCORD_IMPORT_CHANNEL"),
         "session_file": env_str("SESSION_FILE", "/data/session.json"),
         "db_file": env_str("DB_FILE", "/data/audit.db"),
     }

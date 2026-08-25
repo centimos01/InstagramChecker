@@ -89,3 +89,12 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
 - Interaction responses use the REST API callback endpoint, not Gateway responses.
 - The Gateway thread reconnects automatically on disconnect (5s delay).
 - Rate limiting (429) is handled with `retry_after` from the response body.
+
+## ZIP import (Data Download)
+
+- When `DISCORD_IMPORT_CHANNEL` is set, the Gateway subscribes to
+  `GUILD_MESSAGES` intent and monitors that channel for `.zip` attachments.
+- ZIPs are parsed with `parse_instagram_zip()`: extracts `following.json` and
+  `followers_*.json` (Instagram Data Download format).
+- Comparison logic reuses `run_from_zip()` which mirrors `run_once()` but
+  skips the Instagram API entirely. Alerts go to the same `DISCORD_CHANNEL_ID`.

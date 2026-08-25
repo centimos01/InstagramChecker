@@ -68,6 +68,23 @@ Los comandos se registran globalmente al conectar al Gateway y están disponible
 en todos los servidores donde esté el bot. Las comprobaciones **solo** se ejecutan
 cuando se usa `/check` o `--once` desde la CLI del contenedor.
 
+## Importación por ZIP (Data Download)
+
+Si prefieres evitar por completo la API de Instagram (cero riesgo de baneo),
+puedes usar la exportación de datos oficial de Instagram:
+
+1. En Instagram: *Configuración → Tu información → Descargar tu información*.
+   Selecciona formato JSON y rango de fechas.
+2. Descarga el ZIP que te llega por email.
+3. **Arrastra el ZIP al canal de importación** de Discord (el configurado en
+   `DISCORD_IMPORT_CHANNEL`).
+4. El bot detecta el `.zip`, lo parsea (`following.json` + `followers_*.json`),
+   compara con la BD y lanza la alerta de unfollows como siempre.
+
+> **Nota:** necesitas que el bot tenga permiso *Read Message History* en el
+> canal de importación. El intent `GUILD_MESSAGES` se habilita automáticamente
+> al configurar `DISCORD_IMPORT_CHANNEL`.
+
 ## Desplegar en otra máquina
 
 **Opción recomendada** (todo automático con `install.sh`, ver más arriba).
