@@ -4,10 +4,17 @@ Servicio **ultraligero** autohosteado en Docker que audita tu cuenta de Instagra
 detecta quién te ha dejado de seguir (usuarios a los que sigues pero que ya no te
 siguen de vuelta) y envía una alerta a un canal de Discord mediante un Bot.
 
-Stack: **Python 3.13 (Debian Trixie) + instagrapi + SQLite (WAL)**. Sin frameworks
-web, un único proceso con comandos slash de Discord para lanzar comprobaciones
-bajo demanda. Incluye **Rich Presence en tiempo real** y comandos `/status`
-y `/check`.
+Stack: **Python 3.13 (Debian Trixie) + SQLite (WAL)**. Sin frameworks web,
+un único proceso con Gateway de Discord activo. Soporta dos métodos de
+comprobación:
+
+- **Importación por ZIP** (recomendado): subes el ZIP de Instagram Data Download
+  a Discord y el bot lo parsea automáticamente. Cero riesgo de baneo.
+- **API de instagrapi**: descarga seguidos/seguidores directamente (requiere
+  sesión de Instagram, riesgo de detección por Meta).
+
+Incluye **Rich Presence en tiempo real** y comandos slash `/status`, `/check`
+y `/reset`.
 
 Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimos01/InstagramChecker)
 
@@ -26,7 +33,7 @@ la sesión automáticamente.
 | `Dockerfile`       | Imagen `python:3.13-slim` (basada en Debian 13/Trixie), usuario sin privilegios, FS raíz de solo lectura |
 | `docker-compose.yml` | Límites de CPU/RAM, volumen persistente `checker-data:/data`, hardening |
 | `requirements.txt` | `instagrapi` (sin extras pesados), `requests` y `websockets` (Gateway de Discord) |
-| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence y comandos slash |
+| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence, comandos slash e importación ZIP |
 | `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
@@ -36,24 +43,37 @@ El bot se mantiene en espera con el Gateway de Discord conectado. Las
 comprobaciones **no se ejecutan automáticamente**: se lanzan solo cuando
 el usuario lo pide.
 
-1. Carga `session.json` (si existe y es válida) para **no** usar la contraseña
+### Método ZIP (recomendado)
+
+1. El bot monitoriza el canal `DISCORD_IMPORT_CHANNEL` en Discord.
+2. Cuando detecta un `.zip`, lo descarga y parsea `following.json` +
+   `followers_*.json` (formato oficial de Instagram Data Download).
+3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
+4. Si hay unfollows nuevos, envía alerta a Discord con la lista completa.
+5. Responde en el canal de importación confirmando el procesamiento.
+
+### Método API (instagrapi)
+
+1. Carga `session.json` (si existe y es válida) para no usar la contraseña
    cada vez → menos riesgo de baneo/rate-limit de Meta.
 2. Al ejecutar `/check` (o `--once` desde la CLI), descarga la lista de
-   **seguidos** y de **seguidores** (todas las páginas), con una pausa
-   aleatoria de 30–90 s entre ambas llamadas.
-3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
-4. Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord
-   con **todos** los usernames (sin truncar). Si la lista es muy larga se
-   divide automáticamente en varios embeds en el mismo mensaje.
-5. Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
-6. Si un ciclo falla (problema de red, login o API de Instagram), envía un
-   aviso de **error** al canal de Discord.
-7. Actualiza la **Rich Presence** del bot en Discord con los conteos actualizados
-   (seguidos/seguidores) y un cronómetro en tiempo real desde el último chequeo.
-   Al detectar un unfollow se muestra brevemente el username antes de volver
-   a los conteos.
-8. Al arrancar carga los últimos datos desde la BD en la Rich Presence (sin
-   esperar a la primera comprobación).
+   seguidos y de seguidores (todas las páginas), con pausa aleatoria entre
+   ambas llamadas.
+3. Si la API devuelve menos datos de los esperados, reintenta una vez con
+   `use_cache=False` (datos frescos).
+
+### Común a ambos métodos
+
+- Guarda snapshots en SQLite y los compara con el ciclo anterior.
+- Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord
+  con **todos** los usernames (sin truncar). Si la lista es muy larga se
+  divide automáticamente en varios embeds/mensajes.
+- Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
+- Si un ciclo falla (problema de red, login o API), envía un aviso de
+  **error** al canal de Discord.
+- Actualiza la **Rich Presence** del bot en Discord con los conteos
+  actualizados y un cronómetro en tiempo real desde el último chequeo.
+- Al arrancar carga los últimos datos desde la BD en la Rich Presence.
 
 ## Comandos slash de Discord
 
@@ -63,6 +83,7 @@ El bot registra automáticamente estos comandos al iniciar:
 |---------|-------------|
 | `/status` | Muestra seguidos, seguidores, unfollows del último chequeo y total de comprobaciones |
 | `/check` | Lanza una comprobación manual (descarga seguidos/seguidores, compara y alerta si hay unfollows nuevos) |
+| `/reset` | Borra toda la base de datos (snapshots, checks, unfollowers) y empieza desde cero |
 
 Los comandos se registran globalmente al conectar al Gateway y están disponibles
 en todos los servidores donde esté el bot. Las comprobaciones **solo** se ejecutan
@@ -115,6 +136,9 @@ Importante:
    servidor/canal.
 4. Obtén el ID del canal: *Configuración del usuario → Avanzado → Modo desarrollador*,
    clic derecho sobre el canal → *Copiar ID del canal* → `DISCORD_CHANNEL_ID`.
+5. **Si vas a usar importación por ZIP**, crea un canal dedicado y copia su ID
+   → `DISCORD_IMPORT_CHANNEL`. Activa **Message Content Intent** en la pestaña
+   Bot del Developer Portal (Privileged Gateway Intents).
 
 > **Nota:** el bot muestra Rich Presence en tiempo real automáticamente (no
 > necesita permisos extra ni configuración en el Developer Portal). Al arrancar
@@ -169,8 +193,9 @@ para crear `session.json`:
    docker compose up -d
    ```
 
-A partir de ahí el contenedor queda en bucle: cada 6 h (por defecto) compara y
-alerta por Discord. Si algún día Instagram invalida la sesión, vuelve a poner la
+A partir de ahí el bot queda en espera con el Gateway conectado. Las
+comprobaciones se lanzan con `/check` (API) o subiendo un ZIP al canal de
+importación. Si algún día Instagram invalida la sesión, vuelve a poner la
 contraseña (y el código 2FA/seed si hiciera falta) temporalmente y reinicia.
 
 > **Opcional:** ejecutar una única pasada manual (depuración o regenerar sesión):
@@ -208,6 +233,12 @@ Las comprobaciones se lanzan con `/check` desde Discord o con
   ejecutar unas horas antes de volver a intentar.
 - **Los comandos slash no aparecen** → verifica que invitaste al bot con scope
   `applications.commands` en OAuth2.
+- **El bot no detecta ZIPs** → verifica que `DISCORD_IMPORT_CHANNEL` está en
+  `.env` y que el **Message Content Intent** está activado en el Developer Portal.
+- **ZIP con pocos seguidores/seguidos** → Instagram a veces genera ZIPs
+  incompletos. Espera unas horas y vuelve a pedir la descarga.
+- **`MAX_EMBED_SIZE_EXCEEDED`** → la lista de unfollows es muy larga. El bot
+  la divide automáticamente en varios mensajes; si persiste, reporta el error.
 - **`websockets` no instalado / Gateway no arranca** → la presencia del bot no
   se actualiza pero el servicio funciona normal. Reinstala dependencias:
   `docker compose up -d --build`.
