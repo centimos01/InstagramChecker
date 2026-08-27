@@ -4,28 +4,22 @@
 Instagram Unfollow Checker
 ==========================
 
-Audita tu propia cuenta de Instagram, detecta quién te ha dejado de seguir
+Audita tu propia cuenta de Instagram detectando quién te ha dejado de seguir
 (usuarios a los que sigues pero que ya no te siguen de vuelta) y envía una
 alerta a un canal de Discord mediante un Bot.
 
-Arquitectura
-------------
-* Un único proceso Python, sin frameworks web.
-* instagrapi como cliente ligero: carga la sesión guardada (session.json)
-  para no introducir credenciales en cada ejecución y minimizar riesgo de
-  baneo/rate-limit de Meta. Soporta 2FA en el primer login mediante
-  INSTAGRAM_OTP_SEED (seed TOTP, automático) o INSTAGRAM_2FA_CODE (código
-  puntual de 6 dígitos).
-* SQLite en modo WAL como almacén persistente. En cada ciclo se guarda el
-  snapshot actual de "seguidos" y "seguidores", se compara contra lo que hay
-  en base de datos y se registra el histórico de unfollows (con detección de
-  "volvieron a seguirte" para avisar de nuevo si te vuelven a dejar).
-* Comandos slash de Discord (/check, /status) para lanzar comprobaciones bajo
-  demanda. Rich Presence en tiempo real con los conteos actualizados.
-* Importación por ZIP: monitoriza un canal de Discord para detectar ZIPs de
-  Instagram Data Download y comparar sin usar la API.
-* Si un ciclo falla (red, login o API de Instagram) se envía un aviso de error
-  a Discord.
+Método de importación (100% seguro, sin API)
+--------------------------------------------
+* No usa la API de Instagram: no hay sesión, ni contraseña, ni riesgo de baneo.
+* Te bajas el ZIP de Instagram Data Download (exportación oficial) y lo
+  arrastras a un canal de Discord.
+* El bot detecta el `.zip`, lo parsea (`following.json` + `followers_*.json`),
+  compara contra la base de datos y alerta de unfollows nuevos.
+* SQLite en modo WAL como almacén persistente. Se guarda el snapshot actual de
+  "seguidos" y "seguidores", se compara contra lo que hay en base de datos y se
+  registra el histórico de unfollows (con detección de "volvieron a seguirte").
+* Comandos slash de Discord (/status, /reset). Rich Presence en tiempo real con
+  los conteos actualizados.
 
 Variables de entorno: ver .env.example.
 """
@@ -37,7 +31,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
 import sqlite3
 import sys
@@ -48,8 +41,6 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 import requests
-from instagrapi import Client
-from instagrapi.exceptions import ChallengeRequired, LoginRequired, TwoFactorRequired
 
 try:
     import websockets  # noqa: F401 — opcional; si falta, el Gateway no arranca.
@@ -256,111 +247,6 @@ def format_list(names: list[str], limit: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Login de Instagram con reutilización de sesión
-# ---------------------------------------------------------------------------
-
-
-def resolve_verification_code(cfg: dict) -> str:
-    """Devuelve el código 2FA a usar en el login, si hay forma de obtenerlo.
-    Prioriza el seed TOTP (generación automática del código) sobre un código
-    puntual de 6 dígitos proporcionado manualmente."""
-    if cfg["otp_seed"]:
-        try:
-            code = Client.totp_generate_code(cfg["otp_seed"])
-            log.info("Código 2FA generado automáticamente desde INSTAGRAM_OTP_SEED.")
-            return code
-        except Exception as exc:
-            log.warning("No se pudo generar el código TOTP (%s); se intentará sin él.", exc)
-    return cfg["twofa_code"]
-
-
-def login_instagram(cfg: dict) -> Client:
-    """
-    Carga session.json si existe; si la sesión sigue viva la reutiliza y no
-    toca la contraseña. Solo si no hay sesión (o caducó) hace login completo
-    con INSTAGRAM_PASSWORD (y el código 2FA si aplica) y regenera session.json.
-    """
-    def new_client() -> Client:
-        cl = Client()
-        # Pausa aleatoria de 1-3 s entre peticiones internas de instagrapi.
-        cl.delay_range = [1, 3]
-        return cl
-
-    cl = new_client()
-
-    if os.path.exists(cfg["session_file"]):
-        try:
-            cl.load_settings(cfg["session_file"])
-            log.info("Sesión cargada desde %s", cfg["session_file"])
-        except Exception as exc:
-            log.warning("No se pudo cargar %s (%s); se hará login completo.", cfg["session_file"], exc)
-            cl = new_client()
-
-    if cl.user_id:
-        # Validación ligera de la sesión (una llamada a la API).
-        try:
-            cl.account_info()
-            return cl
-        except LoginRequired:
-            log.info("La sesión guardada ha caducado.")
-            cl = new_client()
-
-    if not cfg["password"]:
-        raise RuntimeError(
-            "No hay sesión válida y no se ha configurado INSTAGRAM_PASSWORD. "
-            "Rellénala en .env, arranca el contenedor para generar session.json "
-            "y después puedes vaciarla."
-        )
-
-    log.info("Login completo con contraseña (primera vez o sesión caducada)…")
-    try:
-        code = resolve_verification_code(cfg)
-        cl.login(cfg["username"], cfg["password"], verification_code=code)
-    except TwoFactorRequired as exc:
-        raise RuntimeError(
-            "Instagram pide el código 2FA del primer login. Añade a .env "
-            "INSTAGRAM_OTP_SEED (seed base32 de tu app autenticadora, login "
-            "automático) o INSTAGRAM_2FA_CODE (el código de 6 dígitos actual) "
-            "y vuelve a intentarlo."
-        ) from exc
-    except ChallengeRequired as exc:
-        raise RuntimeError(
-            "Instagram exige verificación manual (challenge). Entra en la app o web "
-            "de Instagram desde la IP de esta máquina, confirma la sesión, y reintenta."
-        ) from exc
-
-    cl.dump_settings(cfg["session_file"])
-    log.info("Sesión guardada en %s", cfg["session_file"])
-    return cl
-
-
-def fetch_account_list(cl: Client, user_id: str, kind: str,
-                       expected: int = 0) -> dict:
-    """Obtiene 'following' o 'followers' completo (amount=0 => todas las páginas).
-    Devuelve {username: user_id}. Si 'expected' > 0 y el resultado difiere,
-    reintenta una vez con use_cache=False y pausa más larga."""
-    label = "seguidos" if kind == "following" else "seguidores"
-
-    for attempt in range(1, 3):
-        if kind == "following":
-            data = cl.user_following(user_id, amount=0, use_cache=(attempt == 1))
-        else:
-            data = cl.user_followers(user_id, amount=0, use_cache=(attempt == 1))
-        count = len(data)
-        log.info("API devolvió %d %s (intento %d, use_cache=%s).",
-                 count, label, attempt, attempt == 1)
-
-        if expected <= 0 or abs(count - expected) <= 1 or attempt == 2:
-            break
-
-        log.warning("Discrepancia: API devuelve %d pero profile dice %d. "
-                    "Reintentando con pausa…", count, expected)
-        time.sleep(random.uniform(15, 30))
-
-    return {u.username: str(u.pk) for u in data.values()}
-
-
-# ---------------------------------------------------------------------------
 # Importación desde ZIP de Instagram (Data Download)
 # ---------------------------------------------------------------------------
 
@@ -438,8 +324,8 @@ def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
 
 def run_from_zip(conn: sqlite3.Connection, cfg: dict,
                  following: dict, followers: dict) -> list:
-    """Ejecuta la comparación usando datos de un ZIP (misma lógica que run_once
-    pero sin llamar a la API de Instagram)."""
+    """Persiste los datos de un ZIP y compara contra la BD, alertando si hay
+    unfollows nuevos."""
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     log.info("ZIP: %d seguidos, %d seguidores.", len(following), len(followers))
@@ -485,157 +371,10 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
 
 
 # ---------------------------------------------------------------------------
-# Ciclo de auditoría
-# ---------------------------------------------------------------------------
-
-
-def run_once(conn: sqlite3.Connection, cfg: dict) -> list:
-    """
-    Ejecuta una comprobación completa:
-    1. Login (reutilizando sesión).
-    2. Descarga de seguidos y seguidores (con pausa aleatoria entre llamadas).
-    3. Persistencia del snapshot en SQLite y comparación con lo anterior.
-    4. Alerta a Discord solo si hay unfollows NUEVOS.
-    """
-    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    cl = login_instagram(cfg)
-    user_id = str(cl.user_id or cl.account_info().pk)
-
-    # Obtener counts reales del perfil para validar los resultados de la API.
-    ai = None
-    try:
-        ai = cl.account_info()
-        log.info("Perfil Instagram: %d seguidores, %d seguidos (según profile).",
-                 ai.follower_count, ai.following_count)
-    except Exception:
-        log.debug("No se pudo obtener account_info() para comparar.")
-
-    log.info("Obteniendo lista de cuentas que sigues…")
-    following = fetch_account_list(cl, user_id, "following",
-                                   expected=ai.following_count if ai else 0)
-    log.info("Seguidos: %d", len(following))
-
-    # Pausa aleatoria entre las dos llamadas grandes: comportamiento orgánico
-    # y menos presión sobre los rate-limits de Meta.
-    time.sleep(random.uniform(30, 90))
-
-    log.info("Obteniendo lista de tus seguidores…")
-    followers = fetch_account_list(cl, user_id, "followers",
-                                   expected=ai.follower_count if ai else 0)
-    log.info("Seguidores: %d", len(followers))
-
-    # ---- Persistir el estado de esta ejecución (ambas listas obtenidas). ----
-    save_snapshot(conn, "following", following, started)
-    save_snapshot(conn, "followers", followers, started)
-
-    new_unfollows = compute_new_unfollows(conn, following, set(followers), started)
-
-    # Las tablas de snapshot solo conservan el estado vigente del último ciclo.
-    prune_old_snapshots(conn, "following", started)
-    prune_old_snapshots(conn, "followers", started)
-
-    finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    conn.execute(
-        """INSERT INTO checks (started_at, finished_at, ok, following, followers, unfollows)
-           VALUES (?, ?, 1, ?, ?, ?)""",
-        (started, finished, len(following), len(followers), len(new_unfollows)),
-    )
-    conn.commit()
-
-    # ---- Notificar por Discord solo las bajas nuevas. ----
-    if new_unfollows:
-        # Mostrar brevemente el unfollow más reciente en la presencia del bot.
-        update_bot_presence(len(following), len(followers), unfollow=new_unfollows[0])
-        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        footer = (
-            f"Chequeo #{check_id} · seguidos: {len(following)} "
-            f"· seguidores: {len(followers)}"
-        )
-        discord_embed(
-            cfg["discord_token"],
-            cfg["discord_channel"],
-            f"{len(new_unfollows)} nuevo(s) unfollow(s) detectado(s)",
-            format_list(new_unfollows),
-            0xED4245,  # rojo Discord
-            footer=footer,
-            timestamp=finished,
-        )
-        log.info("Enviadas alertas para %d unfollow(s) nuevos.", len(new_unfollows))
-    else:
-        log.info("Sin nuevos unfollows en este ciclo.")
-
-    # Actualizar presencia del bot con los conteos finales.
-    update_bot_presence(len(following), len(followers))
-
-    return new_unfollows
-
-
-# ---------------------------------------------------------------------------
-# Avisos de fallo por Discord
-# ---------------------------------------------------------------------------
-
-
-def describe_failure(exc: BaseException) -> str:
-    """Convierte una excepción en un texto claro para el log y la alerta."""
-    if isinstance(exc, LoginRequired):
-        return (
-            f"Sesión de Instagram inválida o caducada ({exc}). "
-            "Rellena INSTAGRAM_PASSWORD (+2FA si lo pide) en .env y reinicia."
-        )
-    if isinstance(exc, RuntimeError):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
-
-
-def notify_failure(conn: sqlite3.Connection, cfg: dict, exc: BaseException, started: str) -> None:
-    """
-    Registra un ciclo fallido en SQLite y, si es el primer fallo tras un ciclo
-    correcto, envía un aviso de error a Discord (evita repetir la alerta cada
-    ciclo mientras el problema persista).
-    """
-    try:
-        finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        description = describe_failure(exc)
-
-        # ¿Es la primera vez que falla tras un ciclo con éxito?
-        prev = conn.execute("SELECT ok FROM checks ORDER BY id DESC LIMIT 1").fetchone()
-        first_failure = prev is None or prev["ok"] == 1
-
-        conn.execute(
-            """INSERT INTO checks (started_at, finished_at, ok, following, followers, unfollows)
-               VALUES (?, ?, 0, 0, 0, 0)""",
-            (started, finished),
-        )
-        conn.commit()
-
-        log.error("Fallo en la comprobación: %s", description)
-        if not first_failure:
-            log.info("El problema persiste desde el ciclo anterior; no se reenvía alerta.")
-            return
-
-        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        footer = f"Chequeo fallido #{check_id} · se reintentará en el siguiente ciclo"
-        discord_embed(
-            cfg["discord_token"],
-            cfg["discord_channel"],
-            "Error en la comprobación de Instagram",
-            f"```\n{description}\n```",
-            0xFAA61A,  # ámbar Discord (errores del sistema)
-            footer=footer,
-            timestamp=finished,
-        )
-    except Exception:
-        # Nunca dejes que un fallo al notificar el error mate el bucle principal.
-        log.exception("No se pudo registrar/notificar el fallo del ciclo.")
-
-
-# ---------------------------------------------------------------------------
 # Discord Gateway — Rich Presence en tiempo real
 # ---------------------------------------------------------------------------
 
 _gateway: DiscordGateway | None = None  # instancia global (ver más abajo)
-_check_lock = threading.Lock()  # evita que run_once se ejecute en paralelo
 
 
 class DiscordGateway:
@@ -871,11 +610,6 @@ class DiscordGateway:
             "type": 1,
         },
         {
-            "name": "check",
-            "description": "Fuerza una comprobación manual ahora mismo",
-            "type": 1,
-        },
-        {
             "name": "reset",
             "description": "Borra toda la base de datos y empieza desde cero",
             "type": 1,
@@ -899,8 +633,6 @@ class DiscordGateway:
             name = interaction.get("data", {}).get("name", "")
             if name == "status":
                 await self._cmd_status(interaction)
-            elif name == "check":
-                await self._cmd_check(interaction)
             elif name == "reset":
                 await self._cmd_reset(interaction)
             else:
@@ -1036,49 +768,6 @@ class DiscordGateway:
         }
         await self._respond(interaction, embeds=[embed])
 
-    def _run_check(self) -> None:
-        """Ejecuta run_once bajo lock (seguro para llamar desde otros hilos)."""
-        with _check_lock:
-            run_once(self.conn, self.cfg)
-
-    async def _cmd_check(self, interaction: dict) -> None:
-        """Responde al comando /check y lanza una comprobación manual."""
-        await self._respond(interaction,
-                            content="⏳ Comprobación manual en curso…",
-                            flags=64)  # EPHEMERAL
-        # Ejecutar run_once en el hilo principal
-        try:
-            await asyncio.to_thread(self._run_check)
-            def _query():
-                row = self.conn.execute(
-                    "SELECT following, followers, unfollows FROM checks "
-                    "WHERE ok = 1 ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                return row
-            row = await asyncio.to_thread(_query)
-            if row:
-                following, followers, unfollows = row
-                msg = (
-                    f"✅ Comprobación completada.\n"
-                    f"👤 Seguidos: **{following}** · "
-                    f"👥 Seguidores: **{followers}** · "
-                    f"🚫 Unfollows nuevos: **{unfollows}**"
-                )
-            else:
-                msg = "✅ Comprobación completada (sin datos)."
-            # Editar la respuesta original
-            await self._rest(
-                "PATCH",
-                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
-                json={"content": msg},
-            )
-        except Exception as exc:
-            await self._rest(
-                "PATCH",
-                f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
-                json={"content": f"❌ Error: {exc}"},
-            )
-
     async def _cmd_reset(self, interaction: dict) -> None:
         """Borra toda la base de datos y reinicia la Rich Presence."""
         await self._respond(interaction, content="⏳ Reseteando base de datos…")
@@ -1126,9 +815,7 @@ def update_bot_presence(following: int = 0, followers: int = 0,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Auditor de unfollows de Instagram")
-    parser.add_argument("--once", action="store_true",
-                        help="Ejecuta una única comprobación y termina (útil para generar la sesión o depurar)")
+    parser = argparse.ArgumentParser(description="Auditor de unfollows de Instagram (importación ZIP)")
     parser.add_argument("--debug", action="store_true", help="Log en nivel DEBUG")
     args = parser.parse_args()
 
@@ -1137,22 +824,15 @@ def main() -> None:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    # Silencia el logging verboso de instagrapi.
-    logging.getLogger("instagrapi").setLevel(logging.WARNING)
 
     cfg = {
-        "username": env_str("INSTAGRAM_USERNAME"),
-        "password": env_str("INSTAGRAM_PASSWORD"),
-        "otp_seed": env_str("INSTAGRAM_OTP_SEED"),
-        "twofa_code": env_str("INSTAGRAM_2FA_CODE"),
         "discord_token": env_str("DISCORD_BOT_TOKEN"),
         "discord_channel": env_str("DISCORD_CHANNEL_ID"),
         "import_channel": env_str("DISCORD_IMPORT_CHANNEL"),
-        "session_file": env_str("SESSION_FILE", "/data/session.json"),
         "db_file": env_str("DB_FILE", "/data/audit.db"),
     }
 
-    missing = [k for k in ("username", "discord_token", "discord_channel") if not cfg[k]]
+    missing = [k for k in ("discord_token", "discord_channel", "import_channel") if not cfg[k]]
     if missing:
         log.error("Faltan variables de entorno obligatorias: %s",
                   ", ".join(k.upper() for k in missing))
@@ -1160,17 +840,8 @@ def main() -> None:
 
     conn = db_connect(cfg["db_file"], check_same_thread=False)
 
-    # Modo manual: una sola pasada (genera session.json la primera vez).
-    if args.once:
-        try:
-            with _check_lock:
-                run_once(conn, cfg)
-        except Exception:
-            log.exception("Fallo en la comprobación manual")
-            sys.exit(1)
-        return
-
-    # Iniciar el Gateway de Discord para Rich Presence y slash commands.
+    # Iniciar el Gateway de Discord para Rich Presence, slash commands e
+    # importación de ZIPs por el canal de importación.
     global _gateway
     try:
         _gateway = DiscordGateway(cfg["discord_token"], conn, cfg)
@@ -1179,7 +850,7 @@ def main() -> None:
         log.warning("No se pudo iniciar el Gateway de Discord (%s). "
                     "Rich Presence deshabilitado.", exc)
 
-    log.info("Esperando comandos de Discord (/check, /status)…")
+    log.info("Esperando ZIPs de Instagram en el canal de importación…")
     # Mantener el proceso vivo; el Gateway corre en su propio hilo.
     try:
         while True:

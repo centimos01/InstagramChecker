@@ -32,7 +32,7 @@ services:
     mem_limit: 512m
     mem_reservation: 128m
 
-    # Volumen persistente: sesión de Instagram (session.json) + SQLite.
+    # Volumen persistente: base de datos SQLite.
     # Como volumen NOMBRADO, Docker copia automáticamente el propietario
     # (usuario 'app') al crearlo, evitando problemas de permisos.
     volumes:

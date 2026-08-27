@@ -23,7 +23,7 @@ RUN groupadd --system app && \
 
 COPY main.py .
 
-# Directorio de datos persistente (sesión de Instagram + SQLite).
+# Directorio de datos persistente (base de datos SQLite).
 RUN mkdir -p /data && chown -R app:app /data
 
 VOLUME ["/data"]
