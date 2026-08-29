@@ -178,6 +178,23 @@ def compute_new_unfollows(conn: sqlite3.Connection, following: dict, followers: 
     return new_unfollows
 
 
+def collect_followers_before(conn: sqlite3.Connection) -> set:
+    """Devuelve el conjunto de followers vigente en la BD (antes de que la
+    ejecución actual los sobrescriba)."""
+    rows = conn.execute("SELECT username FROM followers").fetchall()
+    return {r["username"] for r in rows}
+
+
+def compute_new_non_following_unfollows(conn: sqlite3.Connection,
+                                        prev_followers: set,
+                                        current_followers: set,
+                                        following: set) -> list:
+    """Detecta a quienes te seguían pero ya no, y TÚ NO los seguías.
+    Es el caso opuesto al clásico: no es un 'no me siguen de vuelta',
+    sino 'me siguen pero yo no los sigo, y me dejaron'."""
+    return sorted((prev_followers - current_followers) - following)
+
+
 # ---------------------------------------------------------------------------
 # Alerta a Discord (API REST directa, sin librerías extra)
 # ---------------------------------------------------------------------------
@@ -330,10 +347,21 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
 
     log.info("ZIP: %d seguidos, %d seguidores.", len(following), len(followers))
 
+    # Capturar el estado anterior de seguidores antes de sobrescribir.
+    prev_followers = collect_followers_before(conn)
+
     save_snapshot(conn, "following", following, started)
     save_snapshot(conn, "followers", followers, started)
 
     new_unfollows = compute_new_unfollows(conn, following, set(followers), started)
+
+    # Caso opuesto (opcional): te dejaron de seguir pero no los seguías.
+    new_nf_unfollows = []
+    if cfg.get("notify_non_following"):
+        new_nf_unfollows = compute_new_non_following_unfollows(
+            conn, prev_followers, set(followers), set(following))
+        log.info("ZIP: %d nuevo(s) unfollow(s) de perfiles que no seguías.",
+                 len(new_nf_unfollows))
 
     prune_old_snapshots(conn, "following", started)
     prune_old_snapshots(conn, "followers", started)
@@ -365,6 +393,24 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
         log.info("Enviadas alertas para %d unfollow(s) nuevos.", len(new_unfollows))
     else:
         log.info("Sin nuevos unfollows en esta importación.")
+
+    # Alerta del caso opuesto (perfiles que no seguías y te dejaron).
+    if new_nf_unfollows:
+        footer = (
+            f"Importación ZIP · seguidos: {len(following)} "
+            f"· seguidores: {len(followers)}"
+        )
+        discord_embed(
+            cfg["discord_token"],
+            cfg["discord_channel"],
+            f"{len(new_nf_unfollows)} perfil(es) que no seguías te dejaron",
+            format_list(new_nf_unfollows),
+            0xEB459E,  # rosa/fucsia Discord
+            footer=footer,
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        log.info("Enviadas alertas para %d unfollow(s) de perfiles no seguidos.",
+                 len(new_nf_unfollows))
 
     update_bot_presence(len(following), len(followers))
     return new_unfollows
@@ -829,6 +875,7 @@ def main() -> None:
         "discord_token": env_str("DISCORD_BOT_TOKEN"),
         "discord_channel": env_str("DISCORD_CHANNEL_ID"),
         "import_channel": env_str("DISCORD_IMPORT_CHANNEL"),
+        "notify_non_following": env_str("NOTIFY_NON_FOLLOWING_UNFOLLOWS", "false").lower() in ("1", "true", "yes", "on"),
         "db_file": env_str("DB_FILE", "/data/audit.db"),
     }
 

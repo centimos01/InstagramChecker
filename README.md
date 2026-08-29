@@ -215,8 +215,20 @@ docker run --rm \
   sh -c "tar czf /backup/backup-$(date +%F).tar.gz -C /data ."
 ```
 
-Las comprobaciones se lanzan con `/check` desde Discord o con
-`docker compose exec instagram-checker python main.py --once`.
+Las comprobaciones se lanzan subiendo un ZIP de Instagram Data Download al
+canal de importación.
+
+### Tipos de alerta
+
+| Alerta | Color | Configuración |
+|--------|-------|---------------|
+| Alguien que sigues te dejó de seguir (unfollower clásico) | Rojo | Siempre activa |
+| Alguien que NO seguías te dejó de seguir | Rosa/fucsia | `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` |
+
+Por defecto solo se avisa del primer caso. Si quieres que el bot también
+avise cuando un perfil que no seguías (por ejemplo, un seguidor que nunca
+seguiste) te deja de seguir, pon `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` en
+`.env` y reinicia.
 
 ## 6. Solución de problemas
 
