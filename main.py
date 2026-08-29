@@ -111,11 +111,45 @@ def db_connect(path: str, *, check_same_thread: bool = True) -> sqlite3.Connecti
             refollowed     INTEGER NOT NULL DEFAULT 0   -- volvió a seguirte
         );
 
+        -- Ajustes persistentes modificables vía Discord (/notify).
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_following_seen ON following(last_seen);
         CREATE INDEX IF NOT EXISTS idx_followers_seen ON followers(last_seen);
         """
     )
     return conn
+
+
+def db_get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    """Devuelve el valor de un ajuste de la BD (o el default si no existe)."""
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def db_set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Guarda o actualiza un ajuste en la BD."""
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+
+
+def notify_non_following_enabled(conn: sqlite3.Connection, cfg: dict) -> bool:
+    """El flag NOTIFY_NON_FOLLOWING_UNFOLLOWS se controla desde Discord (/notify)
+    y persiste en la BD; el valor de .env solo actúa como valor inicial."""
+    val = db_get_setting(conn, "notify_non_following", "")
+    if val == "":
+        # Primera vez: usar el valor de .env como estado inicial.
+        default = "true" if cfg.get("notify_non_following") else "false"
+        db_set_setting(conn, "notify_non_following", default)
+        val = default
+    return val.lower() in ("1", "true", "yes", "on")
 
 
 def save_snapshot(conn: sqlite3.Connection, table: str, rows: dict, run_at: str) -> None:
@@ -357,7 +391,7 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
 
     # Caso opuesto (opcional): te dejaron de seguir pero no los seguías.
     new_nf_unfollows = []
-    if cfg.get("notify_non_following"):
+    if notify_non_following_enabled(conn, cfg):
         new_nf_unfollows = compute_new_non_following_unfollows(
             conn, prev_followers, set(followers), set(following))
         log.info("ZIP: %d nuevo(s) unfollow(s) de perfiles que no seguías.",
@@ -660,6 +694,19 @@ class DiscordGateway:
             "description": "Borra toda la base de datos y empieza desde cero",
             "type": 1,
         },
+        {
+            "name": "notify",
+            "description": "Activa o desactiva la alerta de perfiles que no seguías y te dejaron",
+            "type": 1,
+            "options": [
+                {
+                    "name": "estado",
+                    "description": "on | off | status",
+                    "type": 3,
+                    "required": False,
+                }
+            ],
+        },
     ]
 
     async def _register_commands(self) -> None:
@@ -671,7 +718,7 @@ class DiscordGateway:
             f"/applications/{self.app_id}/commands",
             json=self.SLASH_COMMANDS,
         )
-        log.info("Slash commands registrados (/status, /check, /reset).")
+        log.info("Slash commands registrados (/status, /reset, /notify).")
 
     async def _handle_interaction(self, interaction: dict) -> None:
         """Despacha una interacción de slash command."""
@@ -681,6 +728,8 @@ class DiscordGateway:
                 await self._cmd_status(interaction)
             elif name == "reset":
                 await self._cmd_reset(interaction)
+            elif name == "notify":
+                await self._cmd_notify(interaction)
             else:
                 await self._respond(interaction, content="Comando desconocido.")
         except Exception as exc:
@@ -837,6 +886,53 @@ class DiscordGateway:
                 f"/webhooks/{self.app_id}/{interaction['token']}/messages/@original",
                 json={"content": f"❌ Error al resetear: {exc}"},
             )
+
+    async def _cmd_notify(self, interaction: dict) -> None:
+        """/notify [on|off|status]: alterna la alerta de perfiles no seguidos."""
+        arg = ""
+        for opt in interaction.get("data", {}).get("options", []) or []:
+            arg = str(opt.get("value", "")).strip().lower()
+        opts = ("on", "off", "status")
+        if arg and arg not in opts:
+            await self._respond(
+                interaction,
+                content="Uso: /notify `on` | `off` | `status` (sin argumento = alternar).",
+            )
+            return
+
+        def _get():
+            return notify_non_following_enabled(self.conn, self.cfg)
+
+        def _set(val):
+            db_set_setting(self.conn, "notify_non_following", "true" if val else "false")
+
+        current = await asyncio.to_thread(_get)
+        if arg == "status":
+            await self._respond(
+                interaction,
+                content=("🔔 Alerta de 'no seguías… te dejaron' está **ACTIVADA**. "
+                         if current else "🔕 Alerta de 'no seguías… te dejaron' está **DESACTIVADA**. ")
+                        + "Usa `/notify on` u `/notify off` para cambiarla.",
+            )
+            return
+        if arg == "":
+            new_val = not current
+        else:
+            new_val = arg == "on"
+        if new_val == current:
+            await self._respond(
+                interaction,
+                content="ℹ️ Esa opción ya está activa. Usá `/notify off` / `/notify on` "
+                        "para invertirla, o `/notify status` para ver el estado.",
+            )
+            return
+        await asyncio.to_thread(_set, new_val)
+        label = "ACTIVADA" if new_val else "DESACTIVADA"
+        await self._respond(
+            interaction,
+            content=f"✅ Alerta de 'no seguías… te dejaron' ahora **{label}**. Esta "
+                    f"configuración persistirá en la base de datos.",
+        )
 
 
 def update_bot_presence(following: int = 0, followers: int = 0,

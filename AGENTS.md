@@ -40,7 +40,7 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
   bot parses it, compares against the SQLite DB, and alerts on new unfollows.
 - Discord Gateway connection (`websockets` library) runs in a daemon thread, handles:
   - Rich Presence updates (from last imported ZIP counts)
-  - Slash command registration and interaction handling (`/status`, `/reset`)
+  - Slash command registration and interaction handling (`/status`, `/reset`, `/notify`)
   - `MESSAGE_CREATE` monitoring of the import channel for `.zip` attachments
 - Data flow: `_handle_message` → `_download` → `parse_instagram_zip` →
   `run_from_zip` (persist + compare + alert).
@@ -67,7 +67,8 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
 
 - **Unfollower clásico** (always on): you follow someone who no longer follows you.
   Red embed.
-- **No-seguías te dejó** (opt-in via `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` in `.env`):
+- **No-seguías te dejó** (opt-in; toggle at runtime via `/notify`, `.env`
+  `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` only seeds the initial value):
   a profile that followed you stopped, but you never followed them. Pink embed.
   Detected by diffing `prev_followers` (captured with `collect_followers_before()`,
   before the new snapshot overwrites) against current followers, minus your
@@ -100,9 +101,14 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
 ## Discord Gateway details
 
 - Uses `websockets` (pinned `>=13.0,<14`) for the Gateway WebSocket connection.
-- Slash commands (`/status`, `/reset`) are registered globally on each connect.
-  The `application_id` is obtained from `GET /users/@me` (same as bot user ID).
+- Slash commands (`/status`, `/reset`, `/notify`) are registered globally on each
+  connect. The `application_id` is obtained from `GET /users/@me` (same as bot ID).
 - `/reset` deletes all rows from `following`, `followers`, `unfollowers`, `checks`.
+- `/notify [on|off|status]` toggles the "no-seguías te dejó" alert at runtime. It
+  stores state in the `settings` table (`db_set_setting`/`db_get_setting`), so it
+  persists across restarts; the `.env` var (`NOTIFY_NON_FOLLOWING_UNFOLLOWS`) only
+  seeds the initial value on first run. Reads come from `notify_non_following_enabled()`
+  at check time, so `/notify` applies immediately with no restart.
 - Interaction responses use the REST API callback endpoint, not Gateway responses.
 - The Gateway thread reconnects automatically on disconnect (5s delay).
 - Rate limiting (429) is handled with `retry_after` from the response body.
