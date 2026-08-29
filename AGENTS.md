@@ -1,7 +1,7 @@
 # AGENTS.md — InstagramChecker
 
 Instagram unfollower auditor: a Docker container that compares following/followers
-(SQLite WAL) and alerts via Discord. **ZIP-only**: data is imported from Instagram
+(SQLite WAL) and alerts via Discord. Data is imported from Instagram
 Data Download ZIPs uploaded to a Discord channel — the Instagram API is NOT used
 (no session, no password, zero ban risk). The project's user-facing content is in
 Spanish (README, logs, messages); keep that language in output.
@@ -9,6 +9,18 @@ Spanish (README, logs, messages); keep that language in output.
 > IMPORTANT: the end user speaks Spanish. Always reply to the user in Spanish, even
 > though this file is written in English. Code comments, log messages and Discord
 > alerts are also in Spanish — keep them that way.
+
+## Branches diverged — know which one you're on
+
+The two branches are deliberately different; don't assume they're equivalent:
+
+- **`Zip-only`** (CURRENT): the target architecture. Removes the entire Instagram API
+  (instagrapi, `run_once`, login/session, `/check`, `--once`, 2FA). Only `--debug` flag.
+- **`main`**: legacy version that STILL uses the Instagram API (`instagrapi`, `run_once`,
+  `/check`, `--once`, `INSTAGRAM_*` env vars). Kept around as reference/fallback.
+
+Only `requirements.txt` for `Zip-only` is `requests` + `websockets`. When editing, work
+on `Zip-only` unless asked otherwise. `git branch --show-current` before touching code.
 
 ## Work machine vs. deploy target
 
@@ -51,6 +63,16 @@ Spanish (README, logs, messages); keep that language in output.
   prunes old snapshots, records a `checks` row and sends alerts to
   `DISCORD_CHANNEL_ID`.
 
+## Two alert types (configurable)
+
+- **Unfollower clásico** (always on): you follow someone who no longer follows you.
+  Red embed.
+- **No-seguías te dejó** (opt-in via `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` in `.env`):
+  a profile that followed you stopped, but you never followed them. Pink embed.
+  Detected by diffing `prev_followers` (captured with `collect_followers_before()`,
+  before the new snapshot overwrites) against current followers, minus your
+  `following`. No-op on first import (no prior snapshot).
+
 ## Data, compose and operation
 
 - Persistent state in named volume `checker-data:/data` (`audit.db` WAL),
@@ -62,6 +84,7 @@ Spanish (README, logs, messages); keep that language in output.
 - main.py: single entry point, 100% env-var config; only flag `--debug`.
   Mandatory env vars: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`,
   `DISCORD_IMPORT_CHANNEL` (main.py exits with code 2 if any missing).
+  Optional: `NOTIFY_NON_FOLLOWING_UNFOLLOWS` (see "Two alert types").
 - Never commit `.env` (`.dockerignore` excludes it from the build context).
 
 ## Deployment (on the target server)
