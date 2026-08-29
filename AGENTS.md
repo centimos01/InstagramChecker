@@ -2,12 +2,26 @@
 
 Instagram unfollower auditor: a Docker container that compares following/followers
 (SQLite WAL) and alerts via Discord. Checks are triggered manually via Discord
-slash commands (`/check`, `/status`), NOT on a timer. The project's user-facing
-content is in Spanish (README, logs, messages); keep that language in output.
+slash commands (`/check`, `/status`, `/reset`), NOT on a timer. The project's
+user-facing content is in Spanish (README, logs, messages); keep that language in
+output.
 
 > IMPORTANT: the end user speaks Spanish. Always reply to the user in Spanish, even
 > though this file is written in English. Code comments, log messages and Discord
 > alerts are also in Spanish — keep them that way.
+
+## Branches diverged — know which one you're on
+
+The two branches are deliberately different; don't assume they're equivalent:
+
+- **`main`** (CURRENT): legacy/fallback version that STILL uses the Instagram API
+  (`instagrapi`, `run_once`, login/session, `/check`, `--once`,
+  `INSTAGRAM_USERNAME`/`INSTAGRAM_PASSWORD`/2FA env vars).
+- **`Zip-only`**: the target architecture — removes the entire Instagram API
+  (instagrapi, `run_once`, login/session, `/check`, `--once`, 2FA). Only `--debug`
+  flag, only `requests` + `websockets` in `requirements.txt`.
+
+`git branch --show-current` before editing; work on `Zip-only` unless asked otherwise.
 
 ## Work machine vs. deploy target
 
@@ -84,8 +98,12 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
 ## Discord Gateway details
 
 - Uses `websockets` (pinned `>=13.0,<14`) for the Gateway WebSocket connection.
-- Slash commands (`/status`, `/check`) are registered globally on each connect.
-  The `application_id` is obtained from `GET /users/@me` (same as bot user ID).
+- Slash commands (`/status`, `/check`, `/reset`) are registered globally on each
+  connect. The `application_id` is obtained from `GET /users/@me` (same as bot ID).
+- `/reset` clears all snapshot/check rows so auditing starts from scratch. Note:
+  on `main` this currently targets `snapshots`/`checks` (the `snapshots` table name
+  is wrong — actual tables are `following`/`followers`/`unfollowers`/`checks`);
+  `Zip-only` has the corrected version.
 - Interaction responses use the REST API callback endpoint, not Gateway responses.
 - The Gateway thread reconnects automatically on disconnect (5s delay).
 - Rate limiting (429) is handled with `retry_after` from the response body.
@@ -98,3 +116,18 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
   `followers_*.json` (Instagram Data Download format).
 - Comparison logic reuses `run_from_zip()` which mirrors `run_once()` but
   skips the Instagram API entirely. Alerts go to the same `DISCORD_CHANNEL_ID`.
+- The Gateway must also have **Message Content Intent** enabled in the Developer
+  Portal, and intents `GUILD_MESSAGES`+`MESSAGE_CONTENT` (=33280) requested when
+  `DISCORD_IMPORT_CHANNEL` is set.
+
+## Two alert types (configurable)
+
+- **Unfollower clásico** (always on): you follow someone who no longer follows you.
+  Red embed (`0xED4245`).
+- **No-seguías te dejó** (opt-in via `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` in `.env`):
+  a profile that followed you stopped, but you never followed them. Pink embed
+  (`0xEB459E`). Computed by `compute_new_non_following_unfollows()`: diff the
+  previous followers snapshot (captured with `collect_followers_before()` before
+  the new one overwrites it) against current followers, minus your `following`.
+  No-op on first check (no prior snapshot). Works for both `run_once()` and
+  `run_from_zip()`.
