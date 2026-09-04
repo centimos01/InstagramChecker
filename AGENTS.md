@@ -92,13 +92,20 @@ API verified against tag 2.18.16 of the subzeroid repo. Differs from older versi
   `/tmp` fails.
 - main.py: single entry point, 100% env-var config; only flags `--once` and `--debug`.
   No automatic loop — all checks are on-demand via Discord or `--once`.
+- **Multi-instancia**: el `docker-compose.yml` usa un YAML anchor (`x-app-base`)
+  para compartir hardening/límites entre los 2+ servicios. Una cuenta nueva =
+  copiar el servicio `instagram-checker` y cambiar `container_name`, `env_file`
+  (`.env.2`) y volumen (`checker-data-2`, declarado en `volumes:`). Cada
+  instancia es un bot de Discord distinto con su propio token/canal/volumen; el
+  código de `main.py` no cambia. `.dockerignore` excluye `.env.*` (nunca subir
+  los `.env.N` al build context).
 - Never commit `.env` or `session.json` (`.dockerignore` already excludes them from the
   build context).
 
 ## Discord Gateway details
 
 - Uses `websockets` (pinned `>=13.0,<14`) for the Gateway WebSocket connection.
-- Slash commands (`/status`, `/check`, `/reset`) are registered globally on each
+- Slash commands (`/status`, `/check`, `/reset`, `/notify`) are registered globally on each
   connect. The `application_id` is obtained from `GET /users/@me` (same as bot ID).
 - `/reset` clears all snapshot/check rows so auditing starts from scratch. Note:
   on `main` this currently targets `snapshots`/`checks` (the `snapshots` table name

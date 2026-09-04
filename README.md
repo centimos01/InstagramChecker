@@ -85,6 +85,24 @@ puedes usar la exportación de datos oficial de Instagram:
 > canal de importación. El intent `GUILD_MESSAGES` se habilita automáticamente
 > al configurar `DISCORD_IMPORT_CHANNEL`.
 
+## Varias cuentas a la vez
+
+Cada cuenta de Instagram necesita su **propio bot de Discord** (token distinto)
+y su propio canal; no comparten estado. Añadir una segunda cuenta es solo copiar
+el servicio en `docker-compose.yml`:
+
+1. Copia `.env` a `.env.2` y dentro cambiar `DISCORD_BOT_TOKEN`,
+   `DISCORD_CHANNEL_ID` y `DISCORD_IMPORT_CHANNEL` (los del segundo bot).
+2. Duplica el servicio `instagram-checker` como `instagram-checker-2` cambiando
+   `container_name`, `env_file: .env.2` y el volumen `checker-data-2`
+   (decláralo también en la sección `volumes:` al final del archivo).
+3. `docker compose up -d --build` levanta tantos bots como servicios tengas.
+
+Cada instancia guarda su propia base de datos en su volumen (y su propia sesión
+de Instagram en `session.json`), así que los unfollows de una cuenta no
+contaminan a otra. Los comandos `/status`, `/check`, `/reset` y `/notify` de
+cada bot actúan solo sobre su cuenta.
+
 ## Desplegar en otra máquina
 
 **Opción recomendada** (todo automático con `install.sh`, ver más arriba).
