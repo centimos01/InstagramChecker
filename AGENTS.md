@@ -86,6 +86,13 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
   Mandatory env vars: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`,
   `DISCORD_IMPORT_CHANNEL` (main.py exits with code 2 if any missing).
   Optional: `NOTIFY_NON_FOLLOWING_UNFOLLOWS` (see "Two alert types").
+- **Multi-instancia**: el `docker-compose.yml` usa un YAML anchor (`x-app-base`)
+  para compartir hardening/límites entre los 2+ servicios. Una cuenta nueva =
+  copiar el servicio `instagram-checker` y cambiar `container_name`, `env_file`
+  (`.env.2`) y volumen (`checker-data-2`, declarado en `volumes:`). Cada
+  instancia es un bot de Discord distinto con su propio token/canal/volumen; el
+  código de `main.py` no cambia. `.dockerignore` excluye `.env.*` (nunca subir
+  los `.env.N` al build context).
 - Never commit `.env` (`.dockerignore` excludes it from the build context).
 
 ## Deployment (on the target server)

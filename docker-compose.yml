@@ -1,13 +1,59 @@
 # ============================================================================
 #  InstagramChecker - docker-compose
 #  `docker compose up -d --build`
+#
+#  VARIAS CUENTAS A LA VEZ
+#  ------------------------
+#  Cada cuenta de Instagram usa SU PROPIO bot de Discord (token distinto) y su
+#  propio canal. No comparten nada entre sí salvo la imagen. Añadir una cuenta
+#  es copiar el bloque del servicio y cambiar container_name / env_file /
+#  volumen (las tres marcadas con ***).
+#
+#  Ejemplo con una segunda cuenta:
+#    1. Copia `.env` a `.env.2` y dentro cambia DISCORD_BOT_TOKEN (token del
+#       segundo bot), DISCORD_CHANNEL_ID y DISCORD_IMPORT_CHANNEL.
+#    2. Duplica abajo el servicio `instagram-checker` como `instagram-checker-2`
+#       con `container_name: instagram-checker-2`, `env_file: .env.2` y el
+#       volumen `checker-data-2` (añádelo en la seccion `volumes:`).
+#    3. `docker compose up -d --build` levanta tantos bots como servicios haya.
 # ============================================================================
 
+# Plantilla común a todas las instancias (YAML anchor): evita repetir el
+# hardening y los límites en cada cuenta nueva.
+x-app-base: &app-base
+  build: .
+
+  # init: true inyecta tini -> reap de zombies + reenvío de SIGTERM.
+  init: true
+
+  # Hardening para un contenedor mínimo.
+  read_only: true                      # el FS raíz es de solo lectura
+  tmpfs:
+    - /tmp:size=64m,noexec,nosuid      # ruta temporal para urllib/python
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+  restart: unless-stopped
+
+  # Límites de recursos (home server modesto).
+  cpus: 0.5
+  mem_limit: 512m
+  mem_reservation: 128m
+
+  # Evita que el log del contenedor crezca sin límite en el disco del host.
+  logging:
+    driver: json-file
+    options:
+      max-size: "5m"
+      max-file: "3"
+
 services:
+  # ===== Cuenta principal (comportamiento idéntico al original) =====
   instagram-checker:
-    build: .
+    <<: *app-base
     container_name: instagram-checker
-    restart: unless-stopped
 
     # Variables sensibles desde .env (no se copian a la imagen).
     env_file:
@@ -15,35 +61,19 @@ services:
     environment:
       TZ: ${TZ:-UTC}
 
-    # init: true inyecta tini -> reap de zombies + reenvío de SIGTERM.
-    init: true
-
-    # Hardening para un contenedor mínimo.
-    read_only: true                      # el FS raíz es de solo lectura
-    tmpfs:
-      - /tmp:size=64m,noexec,nosuid      # ruta temporal para urllib/python
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-
-    # Límites de recursos (home server modesto).
-    cpus: 0.5
-    mem_limit: 512m
-    mem_reservation: 128m
-
     # Volumen persistente: base de datos SQLite.
     # Como volumen NOMBRADO, Docker copia automáticamente el propietario
     # (usuario 'app') al crearlo, evitando problemas de permisos.
     volumes:
       - checker-data:/data
 
-    # Evita que el log del contenedor crezca sin límite en el disco del host.
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "3"
+  # ==================================================================
+  #  Copia el bloque anterior para otra cuenta, cambiando:
+  #    - el nombre del servicio (p.ej. instagram-checker-2)
+  #    - container_name  ***
+  #    - env_file        (.env.2)  ***
+  #    - volumen         (checker-data-2) ***
+  # ==================================================================
 
 volumes:
   checker-data:
