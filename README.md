@@ -84,6 +84,7 @@ El bot registra automáticamente estos comandos al iniciar:
 | `/status` | Muestra seguidos, seguidores, unfollows del último chequeo y total de comprobaciones |
 | `/check` | Lanza una comprobación manual (descarga seguidos/seguidores, compara y alerta si hay unfollows nuevos) |
 | `/reset` | Borra toda la base de datos (snapshots, checks, unfollowers) y empieza desde cero |
+| `/notify` | configura si quieres que notfique siempre que te dejan de seguir (aunque tu no los sigas) |
 
 Los comandos se registran globalmente al conectar al Gateway y están disponibles
 en todos los servidores donde esté el bot. Las comprobaciones **solo** se ejecutan
