@@ -437,7 +437,7 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
         discord_embed(
             cfg["discord_token"],
             cfg["discord_channel"],
-            f"{len(new_nf_unfollows)} perfil(es) que no seguías te dejaron",
+            f"{len(new_nf_unfollows)} perfil(es) que no seguías te dejó de seguir",
             format_list(new_nf_unfollows),
             0xEB459E,  # rosa/fucsia Discord
             footer=footer,
