@@ -41,12 +41,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 import requests
-
-try:
-    import websockets  # noqa: F401 — opcional; si falta, el Gateway no arranca.
-    _HAS_WS = True
-except ImportError:
-    _HAS_WS = False
+import websockets
 
 log = logging.getLogger("ig-check")
 
@@ -188,26 +183,25 @@ def compute_new_unfollows(conn: sqlite3.Connection, following: dict, followers: 
         (run_at,),
     )
 
-    # 2) Candidatos: te sigo yo pero ya no me sigues tú.
-    new_unfollows = []
-    for username in sorted(set(following) - followers):
-        row = conn.execute(
-            "SELECT refollowed FROM unfollowers WHERE username = ?", (username,)
-        ).fetchone()
-        if row is None or row["refollowed"]:
-            new_unfollows.append(username)
+    # 2) Candidatos: te sigo yo pero ya no me sigues tú. Cargar el histórico en
+    #    memoria de una sola vez evita una consulta por usuario candidato.
+    candidates = set(following) - followers
+    if not candidates:
+        return []
+    hist = {r["username"]: r["refollowed"]
+            for r in conn.execute("SELECT username, refollowed FROM unfollowers")}
+    new_unfollows = sorted(u for u in candidates if u not in hist or hist[u])
 
-    # 3) Registrar el nuevo evento en el histórico.
-    for username in new_unfollows:
-        conn.execute(
-            """INSERT INTO unfollowers (username, user_id, first_detected, last_detected, alerts, refollowed)
-               VALUES (?, ?, ?, ?, 1, 0)
-               ON CONFLICT(username) DO UPDATE SET
-                   last_detected = excluded.last_detected,
-                   refollowed    = 0,
-                   alerts        = unfollowers.alerts + 1""",
-            (username, following[username], run_at, run_at),
-        )
+    # 3) Registrar los nuevos eventos en el histórico (una sola pasada).
+    conn.executemany(
+        """INSERT INTO unfollowers (username, user_id, first_detected, last_detected, alerts, refollowed)
+           VALUES (?, ?, ?, ?, 1, 0)
+           ON CONFLICT(username) DO UPDATE SET
+               last_detected = excluded.last_detected,
+               refollowed    = 0,
+               alerts        = unfollowers.alerts + 1""",
+        [(u, following[u], run_at, run_at) for u in new_unfollows],
+    )
 
     return new_unfollows
 
@@ -219,8 +213,7 @@ def collect_followers_before(conn: sqlite3.Connection) -> set:
     return {r["username"] for r in rows}
 
 
-def compute_new_non_following_unfollows(conn: sqlite3.Connection,
-                                        prev_followers: set,
+def compute_new_non_following_unfollows(prev_followers: set,
                                         current_followers: set,
                                         following: set) -> list:
     """Detecta a quienes te seguían pero ya no, y TÚ NO los seguías.
@@ -302,71 +295,59 @@ def format_list(names: list[str], limit: int = 0) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _extract_usernames(data) -> list[str]:
-    """Extrae usernames de varios formatos de Instagram Data Download."""
-    usernames = []
+def _extract_usernames(data) -> set[str]:
+    """Extrae usernames únicos de un JSON del Data Download de Instagram.
+    Soporta el formato clásico (string_list_data[].value) y el nuevo (title)."""
     if isinstance(data, dict):
-        items = data.get("relationships_following",
-                         data.get("followers", data.get("string_list_data", [])))
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    # Formato nuevo: username en "title"
-                    if item.get("title"):
-                        usernames.append(item["title"])
-                    # Formato clásico: username en string_list_data[].value
-                    for entry in item.get("string_list_data", []):
-                        if entry.get("value"):
-                            usernames.append(entry["value"])
-    elif isinstance(data, list):
+        data = data.get("relationships_following",
+                        data.get("followers", data.get("string_list_data", [])))
+
+    usernames: set[str] = set()
+    if isinstance(data, list):
         for item in data:
-            if isinstance(item, dict):
-                if item.get("title"):
-                    usernames.append(item["title"])
-                for entry in item.get("string_list_data", []):
-                    if entry.get("value"):
-                        usernames.append(entry["value"])
+            if not isinstance(item, dict):
+                continue
+            # Preferir string_list_data[].value; si falta, usar title.
+            for entry in item.get("string_list_data", []):
+                if entry.get("value"):
+                    usernames.add(entry["value"])
+                    break
+            else:
+                title = item.get("title")
+                if title:
+                    usernames.add(title)
     return usernames
 
 
 def parse_instagram_zip(zip_bytes: bytes) -> tuple[dict, dict]:
     """Parsea un ZIP de Instagram Data Download.
-    Devuelve (following_dict, followers_dict) como {username: ""}."""
-    following = {}
-    followers = {}
+    Devuelve (following, followers) como {username: ""}."""
+    following: dict = {}
+    followers: dict = {}
 
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
-        log.info("ZIP: %d archivos: %s", len(names),
-                 [n for n in names if "follower" in n.lower() or "following" in n.lower()])
+        log.info("ZIP: %d archivos.", len(names))
+
+        follower_files = sorted(n for n in names
+                                if re.search(r'followers[_-]?\d*\.json$', n))
 
         for name in names:
             if name.endswith("following.json"):
                 raw = json.loads(zf.read(name))
-                log.info("ZIP: following.json tipo=%s, longitud=%d",
-                         type(raw).__name__, len(raw) if isinstance(raw, (list, dict)) else 0)
-                if isinstance(raw, (list, dict)):
-                    sample = str(raw)[:500]
-                    log.info("ZIP: following.json muestra: %s", sample)
-                for u in _extract_usernames(raw):
-                    following[u] = ""
-                log.info("ZIP: %d seguidos encontrados en %s", len(following), name)
+                usrs = _extract_usernames(raw)
+                log.info("ZIP: following.json → %d seguidos.", len(usrs))
+                following = dict.fromkeys(usrs, "")
                 break
 
-        for name in sorted(names):
-            if re.search(r'followers[_-]?\d*\.json$', name):
-                try:
-                    raw = json.loads(zf.read(name))
-                    log.info("ZIP: %s tipo=%s, longitud=%d",
-                             name, type(raw).__name__,
-                             len(raw) if isinstance(raw, (list, dict)) else 0)
-                    if isinstance(raw, (list, dict)) and len(raw) > 0:
-                        log.info("ZIP: %s muestra: %s", name, str(raw)[:500])
-                    for u in _extract_usernames(raw):
-                        followers[u] = ""
-                    log.info("ZIP: +seguidores desde %s (total: %d)", name, len(followers))
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        for name in follower_files:
+            try:
+                raw = json.loads(zf.read(name))
+            except (json.JSONDecodeError, KeyError):
+                continue
+            usrs = _extract_usernames(raw)
+            followers.update(dict.fromkeys(usrs, ""))
+            log.info("ZIP: %s → %d seguidores en total.", name, len(followers))
 
     if not following and not followers:
         raise ValueError("No se encontraron following.json ni followers_*.json en el ZIP")
@@ -387,13 +368,14 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
     save_snapshot(conn, "following", following, started)
     save_snapshot(conn, "followers", followers, started)
 
-    new_unfollows = compute_new_unfollows(conn, following, set(followers), started)
+    current_followers = set(followers)
+    new_unfollows = compute_new_unfollows(conn, following, current_followers, started)
 
     # Caso opuesto (opcional): te dejaron de seguir pero no los seguías.
     new_nf_unfollows = []
     if notify_non_following_enabled(conn, cfg):
         new_nf_unfollows = compute_new_non_following_unfollows(
-            conn, prev_followers, set(followers), set(following))
+            prev_followers, current_followers, set(following))
         log.info("ZIP: %d nuevo(s) unfollow(s) de perfiles que no seguías.",
                  len(new_nf_unfollows))
 
@@ -408,13 +390,12 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
     )
     conn.commit()
 
+    footer = (
+        f"Importación ZIP · seguidos: {len(following)} "
+        f"· seguidores: {len(followers)}"
+    )
+
     if new_unfollows:
-        update_bot_presence(len(following), len(followers), unfollow=new_unfollows[0])
-        check_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        footer = (
-            f"Importación ZIP · seguidos: {len(following)} "
-            f"· seguidores: {len(followers)}"
-        )
         discord_embed(
             cfg["discord_token"],
             cfg["discord_channel"],
@@ -430,10 +411,6 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
 
     # Alerta del caso opuesto (perfiles que no seguías y te dejaron).
     if new_nf_unfollows:
-        footer = (
-            f"Importación ZIP · seguidos: {len(following)} "
-            f"· seguidores: {len(followers)}"
-        )
         discord_embed(
             cfg["discord_token"],
             cfg["discord_channel"],
@@ -446,7 +423,11 @@ def run_from_zip(conn: sqlite3.Connection, cfg: dict,
         log.info("Enviadas alertas para %d unfollow(s) de perfiles no seguidos.",
                  len(new_nf_unfollows))
 
-    update_bot_presence(len(following), len(followers))
+    # Presencia: mostrar el primer unfollow nuevo si lo hay; si no, conteos.
+    if new_unfollows:
+        update_bot_presence(len(following), len(followers), unfollow=new_unfollows[0])
+    else:
+        update_bot_presence(len(following), len(followers))
     return new_unfollows
 
 
@@ -465,8 +446,6 @@ class DiscordGateway:
     RECONNECT_DELAY = 5  # segundos antes de reconectar
 
     def __init__(self, token: str, conn: sqlite3.Connection, cfg: dict):
-        if not _HAS_WS:
-            raise RuntimeError("El paquete 'websockets' no está instalado.")
         self.token = token
         self.conn = conn
         self.cfg = cfg
@@ -479,19 +458,14 @@ class DiscordGateway:
         self._presence_details = ""
         self._presence_ts: float | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="gateway")
+        self._import_lock = asyncio.Lock()  # serializa el procesado de ZIPs
         # GUILD_MESSAGES (1 << 9) para detectar ZIPs; MESSAGE_CONTENT (1 << 15)
         # para recibir el contenido de los mensajes (adjuntos).
-        if cfg.get("import_channel"):
-            self._intents = (1 << 9) | (1 << 15)  # 33280
-        else:
-            self._intents = 0
+        self._intents = (1 << 9) | (1 << 15)  # 33280
 
     # -- Lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
-        if not _HAS_WS:
-            log.warning("websockets no instalado; Rich Presence deshabilitado.")
-            return
         self._thread.start()
         log.info("Discord Gateway iniciado en segundo plano.")
 
@@ -592,9 +566,8 @@ class DiscordGateway:
                 # Slash commands
                 if op == 0 and msg.get("t") == "INTERACTION_CREATE":
                     asyncio.create_task(self._handle_interaction(msg["d"]))
-                # Importación de ZIP
-                if (op == 0 and msg.get("t") == "MESSAGE_CREATE"
-                        and self.cfg.get("import_channel")):
+                # Importación de ZIPs
+                if op == 0 and msg.get("t") == "MESSAGE_CREATE":
                     asyncio.create_task(self._handle_message(msg["d"]))
         except websockets.ConnectionClosed:
             return
@@ -742,46 +715,51 @@ class DiscordGateway:
                 pass
 
     async def _handle_message(self, msg: dict) -> None:
-        """Detecta ZIPs de Instagram en el canal de importación."""
-        channel_id = msg.get("channel_id")
-        if channel_id != self.cfg.get("import_channel"):
+        """Detecta y procesa ZIPs de Instagram en el canal de importación."""
+        if msg.get("channel_id") != self.cfg.get("import_channel"):
             return
-        attachments = msg.get("attachments", [])
+        attachments = [att for att in msg.get("attachments", [])
+                       if att.get("filename", "").lower().endswith(".zip")]
         if not attachments:
             return
-        for att in attachments:
-            filename = att.get("filename", "")
-            if not filename.lower().endswith(".zip"):
-                continue
-            log.info("ZIP detectado: %s (%d bytes)", filename, att.get("size", 0))
-            try:
-                # Descargar el adjunto
+
+        # En serie: evita escrituras concurrentes sobre la BD si llegan varios
+        # ZIPs a la vez.
+        async with self._import_lock:
+            for att in attachments:
                 url = att.get("url")
                 if not url:
                     continue
                 zip_bytes = await self._download(url)
                 if not zip_bytes:
                     continue
-                # Parsear y comparar
-                following, followers = parse_instagram_zip(zip_bytes)
-                await asyncio.to_thread(run_from_zip, self.conn, self.cfg,
-                                        following, followers)
-                # Notificar éxito en el canal
-                await self._rest("POST", f"/channels/{channel_id}/messages",
-                                 json={
-                                     "content": (
-                                         f"✅ Importación completada: "
-                                         f"**{len(following)}** seguidos, "
-                                         f"**{len(followers)}** seguidores."
-                                     ),
-                                 })
-            except Exception as exc:
-                log.warning("Error procesando ZIP %s: %s", filename, exc)
                 try:
-                    await self._rest("POST", f"/channels/{channel_id}/messages",
-                                     json={"content": f"❌ Error al procesar el ZIP: {exc}"})
-                except Exception:
-                    pass
+                    following, followers = parse_instagram_zip(zip_bytes)
+                    await asyncio.to_thread(run_from_zip, self.conn, self.cfg,
+                                            following, followers)
+                except Exception as exc:
+                    log.warning("Error procesando ZIP %s: %s",
+                                att.get("filename"), exc)
+                    try:
+                        await self._rest(
+                            "POST",
+                            f"/channels/{msg['channel_id']}/messages",
+                            json={"content": f"❌ Error al procesar el ZIP: {exc}"},
+                        )
+                    except Exception:
+                        pass
+                    continue
+                await self._rest(
+                    "POST",
+                    f"/channels/{msg['channel_id']}/messages",
+                    json={
+                        "content": (
+                            f"✅ Importación completada: "
+                            f"**{len(following)}** seguidos, "
+                            f"**{len(followers)}** seguidores."
+                        ),
+                    },
+                )
 
     async def _download(self, url: str) -> bytes | None:
         """Descarga un fichero desde Discord CDN (requiere auth)."""

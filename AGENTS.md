@@ -10,17 +10,16 @@ Spanish (README, logs, messages); keep that language in output.
 > though this file is written in English. Code comments, log messages and Discord
 > alerts are also in Spanish — keep them that way.
 
-## Branches diverged — know which one you're on
+## Branch
 
-The two branches are deliberately different; don't assume they're equivalent:
+This is the `Zip-only` branch: the architecture is 100% ZIP import. The Instagram
+API is not used anywhere (no instagrapi, session, login or `INSTAGRAM_*` vars) and
+must not be reintroduced. A legacy `main` branch still contains the old API code;
+ignore it. Work here unless told otherwise, and run `git branch --show-current`
+before touching code.
 
-- **`Zip-only`** (CURRENT): the target architecture. Removes the entire Instagram API
-  (instagrapi, `run_once`, login/session, `/check`, `--once`, 2FA). Only `--debug` flag.
-- **`main`**: legacy version that STILL uses the Instagram API (`instagrapi`, `run_once`,
-  `/check`, `--once`, `INSTAGRAM_*` env vars). Kept around as reference/fallback.
-
-Only `requirements.txt` for `Zip-only` is `requests` + `websockets`. When editing, work
-on `Zip-only` unless asked otherwise. `git branch --show-current` before touching code.
+Dependencies (`requirements.txt`): `requests` + `websockets` only. The entry point
+has a single flag: `--debug`.
 
 ## Work machine vs. deploy target
 
@@ -44,6 +43,8 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
   - `MESSAGE_CREATE` monitoring of the import channel for `.zip` attachments
 - Data flow: `_handle_message` → `_download` → `parse_instagram_zip` →
   `run_from_zip` (persist + compare + alert).
+- ZIP processing is serialized with an `asyncio.Lock` (`_import_lock`): it avoids
+  concurrent SQLite writes if several ZIPs arrive at once.
 - The shared SQLite connection uses `check_same_thread=False` (safe with WAL) and
   `asyncio.to_thread` for blocking DB/message-sending work.
 - `_rest` helper for Discord REST API with retry logic (3 attempts, backoff for
@@ -52,8 +53,8 @@ on `Zip-only` unless asked otherwise. `git branch --show-current` before touchin
 
 ## ZIP parsing
 
-- Gateway intents when `DISCORD_IMPORT_CHANNEL` is set:
-  `GUILD_MESSAGES (1 << 9)` + `MESSAGE_CONTENT (1 << 15)` = `33280`.
+- Gateway intents: `GUILD_MESSAGES (1 << 9)` + `MESSAGE_CONTENT (1 << 15)` = `33280`
+  (siempre activos, porque `DISCORD_IMPORT_CHANNEL` es obligatorio).
   The **Message Content Intent** must ALSO be enabled in the Developer Portal.
 - `parse_instagram_zip()` handles both old and new Instagram JSON formats,
   extracting usernames from either `string_list_data[].value` or `title`.

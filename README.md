@@ -4,17 +4,15 @@ Servicio **ultraligero** autohosteado en Docker que audita tu cuenta de Instagra
 detecta quién te ha dejado de seguir (usuarios a los que sigues pero que ya no te
 siguen de vuelta) y envía una alerta a un canal de Discord mediante un Bot.
 
-Stack: **Python 3.13 (Debian Trixie) + SQLite (WAL)**. Sin frameworks web,
-un único proceso con Gateway de Discord activo. Soporta dos métodos de
-comprobación:
+Stack: **Python 3.13 (Debian Trixie) + SQLite (WAL)**. Sin frameworks web, un
+único proceso con el Gateway de Discord activo.
 
-- **Importación por ZIP** (recomendado): subes el ZIP de Instagram Data Download
-  a Discord y el bot lo parsea automáticamente. Cero riesgo de baneo.
-- **API de instagrapi**: descarga seguidos/seguidores directamente (requiere
-  sesión de Instagram, riesgo de detección por Meta).
+- **Solo importación por ZIP**: subes el ZIP de Instagram Data Download a Discord
+  y el bot lo parsea automáticamente. No se usa la API de Instagram: sin sesión,
+  sin contraseña y **cero riesgo de baneo**.
 
-Incluye **Rich Presence en tiempo real** y comandos slash `/status`, `/check`
-y `/reset`.
+Incluye **Rich Presence en tiempo real** y comandos slash `/status`, `/reset`
+y `/notify`.
 
 Repositorio: [github.com/centimos01/InstagramChecker](https://github.com/centimos01/InstagramChecker)
 
@@ -23,8 +21,7 @@ git clone https://github.com/centimos01/InstagramChecker.git
 ```
 
 **Instalador rápido:** ejecuta `bash install.sh` en el servidor y sigue las
-preguntas — instala Docker, configura `.env`, construye la imagen y genera
-la sesión automáticamente.
+preguntas — instala Docker, configura `.env`, construye la imagen y arranca.
 
 ## Contenido
 
@@ -32,47 +29,29 @@ la sesión automáticamente.
 |--------------------|-------------|
 | `Dockerfile`       | Imagen `python:3.13-slim` (basada en Debian 13/Trixie), usuario sin privilegios, FS raíz de solo lectura |
 | `docker-compose.yml` | Límites de CPU/RAM, volumen persistente `checker-data:/data`, hardening |
-| `requirements.txt` | `instagrapi` (sin extras pesados), `requests` y `websockets` (Gateway de Discord) |
-| `main.py`          | Script autónomo: login por sesión, snapshots SQLite, comparación, alerta Discord, Rich Presence, comandos slash e importación ZIP |
+| `requirements.txt` | `requests` y `websockets` (API REST y Gateway de Discord) |
+| `main.py`          | Script autónomo: espera ZIPs, snapshots SQLite, comparación, alerta Discord, Rich Presence y comandos slash |
 | `install.sh`       | Instalador interactivo para Debian 13: Docker + config + primer arranque |
 | `.env.example`     | Plantilla de configuración |
 
 ## Qué hace `main.py`
 
 El bot se mantiene en espera con el Gateway de Discord conectado. Las
-comprobaciones **no se ejecutan automáticamente**: se lanzan solo cuando
-el usuario lo pide.
+comprobaciones se lanzan **subiendo un ZIP** de Instagram Data Download al canal
+de importación; el bot se encarga de todo lo demás:
 
-### Método ZIP (recomendado)
-
-1. El bot monitoriza el canal `DISCORD_IMPORT_CHANNEL` en Discord.
-2. Cuando detecta un `.zip`, lo descarga y parsea `following.json` +
-   `followers_*.json` (formato oficial de Instagram Data Download).
+1. Detecta el `.zip` en `DISCORD_IMPORT_CHANNEL` y lo descarga.
+2. Parsea `following.json` + `followers_*.json` (formato oficial del Data Download).
 3. Guarda ambos snapshots en SQLite y los compara con el ciclo anterior.
-4. Si hay unfollows nuevos, envía alerta a Discord con la lista completa.
+4. Si hay unfollows nuevos, envía una alerta a Discord con la lista completa.
 5. Responde en el canal de importación confirmando el procesamiento.
 
-### Método API (instagrapi)
+Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord con
+**todos** los usernames (sin truncar). Si la lista es muy larga se divide
+automáticamente en varios embeds/mensajes.
 
-1. Carga `session.json` (si existe y es válida) para no usar la contraseña
-   cada vez → menos riesgo de baneo/rate-limit de Meta.
-2. Al ejecutar `/check` (o `--once` desde la CLI), descarga la lista de
-   seguidos y de seguidores (todas las páginas), con pausa aleatoria entre
-   ambas llamadas.
-3. Si la API devuelve menos datos de los esperados, reintenta una vez con
-   `use_cache=False` (datos frescos).
-
-### Común a ambos métodos
-
-- Guarda snapshots en SQLite y los compara con el ciclo anterior.
-- Solo si hay **unfollows nuevos** (no repetidos) envía un embed a Discord
-  con **todos** los usernames (sin truncar). Si la lista es muy larga se
-  divide automáticamente en varios embeds/mensajes.
-- Recuerda a quien volvió a seguirte: si vuelven a dejarte, avisa de nuevo.
-- Si un ciclo falla (problema de red, login o API), envía un aviso de
-  **error** al canal de Discord.
-- Actualiza la **Rich Presence** del bot en Discord con los conteos
-  actualizados y un cronómetro en tiempo real desde el último chequeo.
+- Recuerda a quien volvió a seguirte: si vuelve a dejarte, avisa de nuevo.
+- Actualiza la **Rich Presence** del bot con los conteos actualizados.
 - Al arrancar carga los últimos datos desde la BD en la Rich Presence.
 
 ## Comandos slash de Discord
@@ -82,18 +61,16 @@ El bot registra automáticamente estos comandos al iniciar:
 | Comando | Descripción |
 |---------|-------------|
 | `/status` | Muestra seguidos, seguidores, unfollows del último chequeo y total de comprobaciones |
-| `/check` | Lanza una comprobación manual (descarga seguidos/seguidores, compara y alerta si hay unfollows nuevos) |
 | `/reset` | Borra toda la base de datos (snapshots, checks, unfollowers) y empieza desde cero |
-| `/notify` | configura si quieres que notfique siempre que te dejan de seguir (aunque tu no los sigas) |
+| `/notify` | Activa/desactiva la alerta de perfiles que no seguías y te dejaron (`on` / `off` / `status`) |
 
 Los comandos se registran globalmente al conectar al Gateway y están disponibles
-en todos los servidores donde esté el bot. Las comprobaciones **solo** se ejecutan
-cuando se usa `/check` o `--once` desde la CLI del contenedor.
+en todos los servidores donde esté el bot.
 
 ## Importación por ZIP (Data Download)
 
-Si prefieres evitar por completo la API de Instagram (cero riesgo de baneo),
-puedes usar la exportación de datos oficial de Instagram:
+Este proyecto evita por completo la API de Instagram (cero riesgo de baneo)
+usando la exportación de datos oficial:
 
 1. En Instagram: *Configuración → Tu información → Descargar tu información*.
    Selecciona formato JSON y rango de fechas.
@@ -104,8 +81,20 @@ puedes usar la exportación de datos oficial de Instagram:
    compara con la BD y lanza la alerta de unfollows como siempre.
 
 > **Nota:** necesitas que el bot tenga permiso *Read Message History* en el
-> canal de importación. El intent `GUILD_MESSAGES` se habilita automáticamente
-> al configurar `DISCORD_IMPORT_CHANNEL`.
+> canal de importación y que el intent **Message Content Intent** esté activado
+> en el Developer Portal (ver sección "Crear el Bot de Discord").
+
+## Tipos de alerta
+
+| Alerta | Color | Configuración |
+|--------|-------|---------------|
+| Alguien que sigues te dejó de seguir (unfollower clásico) | Rojo | Siempre activa |
+| Alguien que NO seguías te dejó de seguir | Rosa/fucsia | `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` o `/notify on` |
+
+Por defecto solo se avisa del primer caso. Si quieres que el bot también avise
+cuando un perfil que no seguías (por ejemplo, un seguidor que nunca seguiste) te
+deja de seguir, usa `/notify on` (persiste en la BD) o pon
+`NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` en `.env` como valor inicial.
 
 ## Varias cuentas a la vez
 
@@ -113,7 +102,7 @@ Cada cuenta de Instagram necesita su **propio bot de Discord** (token distinto)
 y su propio canal; no comparten estado. Añadir una segunda cuenta es solo copiar
 el servicio en `docker-compose.yml`:
 
-1. Copia `.env` a `.env.2` y dentro cambiar `DISCORD_BOT_TOKEN`,
+1. Copia `.env` a `.env.2` y dentro cambia `DISCORD_BOT_TOKEN`,
    `DISCORD_CHANNEL_ID` y `DISCORD_IMPORT_CHANNEL` (los del segundo bot).
 2. Duplica el servicio `instagram-checker` como `instagram-checker-2` cambiando
    `container_name`, `env_file: .env.2` y el volumen `checker-data-2`
@@ -135,15 +124,9 @@ Si prefieres hacerlo paso a paso o la máquina destino no tiene git:
 scp -r InstagramChecker usuario@IP_DEL_SERVIDOR:~/InstagramChecker
 ```
 
-En ambos casos, continúa con los pasos 1–4 (todo se ejecuta en el servidor).
+En ambos casos, continúa con los pasos 1–3 (todo se ejecuta en el servidor).
 
-Importante:
-
-- El **primer login debe hacerse en la máquina destino**: `session.json` se
-  genera allí y queda vinculado a esa IP/red, evitando avisos de seguridad de
-  Instagram por "dispositivo desconocido".
-- No subas `.env` ni `session.json` a ningún repositorio (`.dockerignore` ya
-  los excluye de la imagen).
+No subas `.env` a ningún repositorio (`.dockerignore` lo excluye de la imagen).
 
 ## 1. Crear el Bot de Discord
 
@@ -154,13 +137,13 @@ Importante:
    servidor/canal.
 4. Obtén el ID del canal: *Configuración del usuario → Avanzado → Modo desarrollador*,
    clic derecho sobre el canal → *Copiar ID del canal* → `DISCORD_CHANNEL_ID`.
-5. **Si vas a usar importación por ZIP**, crea un canal dedicado y copia su ID
-   → `DISCORD_IMPORT_CHANNEL`. Activa **Message Content Intent** en la pestaña
-   Bot del Developer Portal (Privileged Gateway Intents).
+5. Crea un canal dedicado para subir los ZIPs y copia su ID →
+   `DISCORD_IMPORT_CHANNEL`. Activa **Message Content Intent** en la pestaña Bot
+   del Developer Portal (Privileged Gateway Intents).
 
 > **Nota:** el bot muestra Rich Presence en tiempo real automáticamente (no
 > necesita permisos extra ni configuración en el Developer Portal). Al arrancar
-> carga los últimos datos desde la BD en vez de esperar al primer chequeo.
+> carga los últimos datos desde la BD en vez de esperar al primer ZIP.
 
 ## 2. Instalar Docker en Debian 13 (Trixie)
 
@@ -180,87 +163,42 @@ docker --version && docker compose version
 ```bash
 cd ~/InstagramChecker        # donde copies los ficheros del proyecto
 cp .env.example .env
-nano .env                    # rellena usuario, token y canal
+nano .env                    # rellena token y canales
+docker compose up -d --build
+docker compose logs -f
 ```
 
-`.env` es ignorado por Dockerfile (`.dockerignore`), así que el token nunca
-entra en la imagen.
+Variables obligatorias: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID` y
+`DISCORD_IMPORT_CHANNEL`. Si falta alguna, el bot sale con error y te lo indica
+en los logs. `.env` es ignorado por Dockerfile (`.dockerignore`), así que el
+token nunca entra en la imagen.
 
-## 4. Primer arranque: generar la sesión
+Cuando el log muestre el Gateway conectado, sube un ZIP al canal de importación
+para empezar a auditar.
 
-El primer login necesita la contraseña (y el código 2FA, si la cuenta lo tiene)
-para crear `session.json`:
-
-1. Pon tu contraseña en `.env` (`INSTAGRAM_PASSWORD=...`).
-2. **Solo si tienes 2FA activado**, elige una de estas dos opciones en `.env`:
-   - `INSTAGRAM_OTP_SEED=` → el seed base32 de tu app autenticadora (el
-     "secret key" del QR/otpauth). El código se genera solo: login 100%
-     automático.
-   - `INSTAGRAM_2FA_CODE=` → el código de 6 dígitos **actual** de la app o SMS.
-     Solo vale para esa primera ejecución (los códigos expiran a los ~30 s).
-3. Arranca el servicio:
-   ```bash
-   docker compose up -d --build
-   docker compose logs -f
-   ```
-4. Espera a que en el log aparezca `Sesión guardada en /data/session.json`
-   (o verifícalo con `docker compose exec instagram-checker ls -l /data`).
-5. Vuelve a vaciar `INSTAGRAM_PASSWORD=`, `INSTAGRAM_OTP_SEED=` e
-   `INSTAGRAM_2FA_CODE=` en `.env` y reinicia:
-   ```bash
-   docker compose up -d
-   ```
-
-A partir de ahí el bot queda en espera con el Gateway conectado. Las
-comprobaciones se lanzan con `/check` (API) o subiendo un ZIP al canal de
-importación. Si algún día Instagram invalida la sesión, vuelve a poner la
-contraseña (y el código 2FA/seed si hiciera falta) temporalmente y reinicia.
-
-> **Opcional:** ejecutar una única pasada manual (depuración o regenerar sesión):
-> `docker compose exec instagram-checker python main.py --once --debug`
-
-## 5. Operación diaria
+## 4. Operación diaria
 
 ```bash
 docker compose logs -f            # seguir los logs
 docker compose restart            # reiniciar
 docker compose down               # parar (conserva el volumen de datos)
 
-# Backup del estado (session.json + audit.db)
+# Backup del estado (audit.db)
 docker run --rm \
   -v instagramchecker_checker-data:/data \
   -v "$PWD":/backup alpine \
   sh -c "tar czf /backup/backup-$(date +%F).tar.gz -C /data ."
 ```
 
-Las comprobaciones se lanzan subiendo un ZIP de Instagram Data Download al
-canal de importación.
+Las comprobaciones se lanzan subiendo un ZIP de Instagram Data Download al canal
+de importación.
 
-### Tipos de alerta
+## 5. Solución de problemas
 
-| Alerta | Color | Configuración |
-|--------|-------|---------------|
-| Alguien que sigues te dejó de seguir (unfollower clásico) | Rojo | Siempre activa |
-| Alguien que NO seguías te dejó de seguir | Rosa/fucsia | `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` |
-
-Por defecto solo se avisa del primer caso. Si quieres que el bot también
-avise cuando un perfil que no seguías (por ejemplo, un seguidor que nunca
-seguiste) te deja de seguir, pon `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` en
-`.env` y reinicia.
-
-## 6. Solución de problemas
-
-- **`LoginRequired` en los logs** → la sesión caducó. Pon `INSTAGRAM_PASSWORD`,
-  `docker compose restart` y espera a que se regenere `session.json`.
 - **Discord no recibe nada (403)** → el bot no está invitado a ese canal o
   falta el permiso *Send Messages*.
 - **`Faltan variables...`** → revisa `.env` (el archivo debe existir, se carga
   con `env_file`).
-- **`TwoFactorRequired` en el primer login** → añade `INSTAGRAM_OTP_SEED` o
-  `INSTAGRAM_2FA_CODE` a `.env` (ver sección 4) y reinicia.
-- **Instagram pide verificación manual (`ChallengeRequired`)** → entra en la app
-  o web de Instagram **desde la IP del servidor**, confirma la sesión, y deja de
-  ejecutar unas horas antes de volver a intentar.
 - **Los comandos slash no aparecen** → verifica que invitaste al bot con scope
   `applications.commands` en OAuth2.
 - **El bot no detecta ZIPs** → verifica que `DISCORD_IMPORT_CHANNEL` está en
@@ -270,12 +208,14 @@ seguiste) te deja de seguir, pon `NOTIFY_NON_FOLLOWING_UNFOLLOWS=true` en
 - **`MAX_EMBED_SIZE_EXCEEDED`** → la lista de unfollows es muy larga. El bot
   la divide automáticamente en varios mensajes; si persiste, reporta el error.
 - **`websockets` no instalado / Gateway no arranca** → la presencia del bot no
-  se actualiza pero el servicio funciona normal. Reinstala dependencias:
+  se actualiza pero el servicio sigue escuchando. Reinstala dependencias:
   `docker compose up -d --build`.
 
 ## Notas de uso responsable
 
-Audita **solo tu propia cuenta**. Lanzar comprobaciones muy seguidas (más de
-una cada pocas horas) aumenta el riesgo de que Meta marque la cuenta como
-sospechosa. Las pausas aleatorias entre llamadas ya incluidas están pensadas
-para comportarse de forma orgánica.
+Audita **solo tu propia cuenta** y sube únicamente tus propios ZIPs de Data
+Download. Cuanto más grande sea el ZIP (cuentas con miles de seguidores), más
+tarda el parseo; los primeros minutos tras subirlo el bot puede no responder.
+
+El proyecto no contacta con Instagram en ningún momento: no hay sesión, no hay
+API y no hay riesgo de detección por Meta.
